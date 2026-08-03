@@ -1,0 +1,36 @@
+# deps
+/node_modules
+/.pnp
+.pnp.*
+
+# next
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+
+# canal figé au build (généré par scripts/set-channel.mjs)
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env — secrets JAMAIS commités
+.env
+.env.*
+!.env.local.example
+!deploy/.env.staging.example
+!deploy/.env.prod.example
+
+# ts
+*.tsbuildinfo
+
+# Variables locales (contiennent le secret de session).
+.env.local

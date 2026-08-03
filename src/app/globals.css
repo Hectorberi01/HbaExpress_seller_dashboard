@@ -1,0 +1,150 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Neumorphisme « Soft UI » clair : les surfaces partagent la teinte du fond,
+       la profondeur vient des ombres jumelles (pas des bordures). Contraste texte
+       conservé (WCAG AA). */
+    --background: 220 16% 94%;
+    --foreground: 222 28% 20%;
+    --card: 220 16% 94%;
+    --card-foreground: 222 28% 20%;
+    --primary: 158 64% 30%; /* vert marque (proche brandGreen) */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 18% 87%;
+    --secondary-foreground: 222 30% 22%;
+    --muted: 222 18% 87%;
+    --muted-foreground: 222 12% 42%;
+    --accent: 222 22% 85%;
+    --accent-foreground: 222 30% 22%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 16% 82%;
+    --input: 222 20% 91%;
+    --ring: 158 64% 34%;
+    --radius: 0.9rem;
+
+    /* Ombres neumorphiques (source de lumière en haut-gauche).
+       Teinte d'ombre éclaircie vers le blanc (gris neutre quasi-blanc, sans bleu). */
+    --nm-light: 255 255 255;
+    --nm-dark: 218 222 228; /* ~#dadee4 : quasi-blanc, remplace #a3b1c6 */
+    --nm-raised:
+      -6px -6px 12px rgba(var(--nm-light), 0.9),
+      6px 6px 14px rgba(var(--nm-dark), 0.9);
+    --nm-raised-sm:
+      -3px -3px 7px rgba(var(--nm-light), 0.85),
+      3px 3px 8px rgba(var(--nm-dark), 0.85);
+    --nm-inset:
+      inset 3px 3px 7px rgba(var(--nm-dark), 0.9),
+      inset -3px -3px 7px rgba(var(--nm-light), 0.9);
+    --nm-inset-sm:
+      inset 2px 2px 4px rgba(var(--nm-dark), 0.85),
+      inset -2px -2px 4px rgba(var(--nm-light), 0.85);
+
+    /* Champs (input/textarea/select) : creux 3D marqué (gris neutre). */
+    --nm-input:
+      inset 3px 3px 6px rgba(60, 64, 74, 0.16),
+      inset -3px -3px 6px rgba(255, 255, 255, 0.95);
+
+    /* Élévation prononcée (effet 3D) pour cartes/tableaux/dialogues :
+       ombre portée neutre (grise, sans bleu) + reflet clair en haut-gauche. */
+    --nm-elevated:
+      0 2px 4px rgba(60, 64, 74, 0.06),
+      0 10px 22px rgba(60, 64, 74, 0.12),
+      0 24px 48px rgba(60, 64, 74, 0.15),
+      -5px -5px 12px rgba(255, 255, 255, 0.7);
+    --nm-elevated-hover:
+      0 4px 8px rgba(60, 64, 74, 0.08),
+      0 16px 32px rgba(60, 64, 74, 0.16),
+      0 32px 64px rgba(60, 64, 74, 0.20),
+      -6px -6px 14px rgba(255, 255, 255, 0.75);
+
+    /* Boutons : ombre portée (3D) au repos / survol / clic. */
+    --nm-btn:
+      0 2px 4px rgba(60, 64, 74, 0.10),
+      0 6px 12px rgba(60, 64, 74, 0.14),
+      -3px -3px 7px rgba(255, 255, 255, 0.55);
+    --nm-btn-hover:
+      0 4px 8px rgba(60, 64, 74, 0.14),
+      0 12px 22px rgba(60, 64, 74, 0.20),
+      -4px -4px 9px rgba(255, 255, 255, 0.6);
+    --nm-btn-active:
+      0 1px 2px rgba(60, 64, 74, 0.14),
+      inset 0 2px 5px rgba(60, 64, 74, 0.18);
+  }
+
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 47% 8%;
+    --card-foreground: 210 40% 98%;
+    --primary: 158 64% 42%;
+    --primary-foreground: 222.2 47% 8%;
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 217.2 32.6% 17.5%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 45%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217.2 32.6% 20%;
+    --input: 217.2 32.6% 20%;
+    --ring: 158 64% 42%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* ============================================================================
+   Neumorphisme — utilitaires + application globale aux éléments natifs.
+   ============================================================================ */
+@layer components {
+  .nm-raised { box-shadow: var(--nm-raised); }
+  .nm-raised-sm { box-shadow: var(--nm-raised-sm); }
+  .nm-inset { box-shadow: var(--nm-inset); }
+  .nm-inset-sm { box-shadow: var(--nm-inset-sm); }
+  .nm-elevated { box-shadow: var(--nm-elevated); }
+
+  /* Boutons en relief (ombre portée fiable, indépendante de la composition Tailwind). */
+  .nm-button { box-shadow: var(--nm-btn); }
+  .nm-button:hover { box-shadow: var(--nm-btn-hover); }
+  .nm-button:active { box-shadow: var(--nm-btn-active); }
+  .nm-button:disabled { box-shadow: var(--nm-btn); }
+
+  /* Champs creusés 3D. Le focus passe par outline (n'écrase pas le box-shadow). */
+  .nm-input { box-shadow: var(--nm-input); }
+  .nm-input:focus-visible { box-shadow: var(--nm-input); outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+
+  /* Champs natifs <select> (utilisés tels quels dans plusieurs pages) : look creusé. */
+  .dark select,
+  select.flex {
+    box-shadow: var(--nm-input);
+    border-color: transparent !important;
+    background-image: none;
+  }
+  select.flex:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Barre de défilement discrète, cohérente avec le style doux. */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(var(--nm-dark), 0.5);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-track { background: transparent; }
+}

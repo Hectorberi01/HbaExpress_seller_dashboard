@@ -1,0 +1,12 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="HBA Express">
+  <!-- Tuile blanche arrondie (style icône d'app) -->
+  <rect x="12" y="12" width="488" height="488" rx="112" fill="#FFFFFF" stroke="#E6EAE7" stroke-width="2"/>
+  <!-- Monogramme HBA, vert forêt -->
+  <text x="256" y="308" text-anchor="middle"
+        font-family="Georgia, 'Times New Roman', 'Playfair Display', serif"
+        font-weight="700" font-size="176" letter-spacing="-2"
+        fill="#0F5C34">HBA</text>
+  <!-- Swoosh signature : courbe qui traverse le monogramme et remonte à droite -->
+  <path d="M118 356 C 210 388, 322 312, 402 252" stroke="#0F5C34" stroke-width="10"
+        stroke-linecap="round" fill="none"/>
+</svg>
