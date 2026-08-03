@@ -1,0 +1,27 @@
+# Ce qui ne doit JAMAIS entrer dans le contexte de build.
+#
+# `.env*` en tête de liste, et ce n'est pas une précaution de principe : `.env.local`
+# contient l'URL du BFF et le secret de chiffrement de session. Copié dans une couche
+# de l'image, il devient lisible par quiconque peut tirer cette image du registre —
+# et le secret de session permet de forger le cookie de n'importe quel vendeur.
+.env
+.env.*
+
+node_modules
+.next
+out
+
+.git
+.github
+.gitignore
+
+npm-debug.log*
+yarn-error.log*
+
+Dockerfile
+.dockerignore
+README.md
+
+.vscode
+.idea
+.DS_Store

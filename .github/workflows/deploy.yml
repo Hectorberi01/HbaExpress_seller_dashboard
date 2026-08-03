@@ -1,0 +1,152 @@
+name: Console vendeur · build & deploy
+
+# push develop_staging → staging (image « seller-console:staging »)
+# push develop         → prod    (image « seller-console:latest »)
+#
+# La console vendeur est un service de la stack compose du VPS (déployée avec le
+# backend). Ici on (re)construit son image, on la pousse sur GHCR, puis on redéploie
+# CE SEUL service — jamais toute la pile.
+#
+# Secrets requis (par environnement GitHub « staging » et « prod ») :
+#   GHCR_TOKEN                                        écriture sur ghcr.io
+#   DEPLOY_SSH_HOST, DEPLOY_SSH_USER, DEPLOY_SSH_KEY  accès SSH au VPS
+#   DEPLOY_SSH_PORT                                   facultatif (8022 par défaut)
+
+on:
+  push:
+    branches: [develop_staging, develop]
+  workflow_dispatch:
+
+concurrency:
+  # Deux déploiements simultanés sur le même environnement se marcheraient dessus :
+  # le second `up -d` pourrait démarrer une image que le premier est en train de
+  # remplacer. On annule le précédent — c'est le plus récent qui compte.
+  group: seller-console-deploy-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/hectorberi01/seller-console
+  TAG: ${{ github.ref_name == 'develop' && 'latest' || 'staging' }}
+  ENVN: ${{ github.ref_name == 'develop' && 'prod' || 'staging' }}
+  # Chemins d'infra fixés par le rôle Ansible, différents selon l'environnement.
+  APP_DIR: ${{ github.ref_name == 'develop' && '/opt/marketplace' || '/opt/marketplace-staging' }}
+  COMPOSE: ${{ github.ref_name == 'develop' && 'docker-compose.prod.yml' || 'docker-compose.staging.yml' }}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # 1. VÉRIFICATION — avant de construire quoi que ce soit.
+  #
+  # `tsc --noEmit` puis `next build`. Le second couvre le premier, mais échoue plus
+  # tard et plus obscurément : un type faux se lit mieux dans la sortie de `tsc` que
+  # dans une trace de compilation Next. Deux minutes de plus, un diagnostic bien
+  # meilleur le jour où ça casse.
+  #
+  # Ce travail est SÉPARÉ du build d'image : une erreur de type ne doit pas produire
+  # une image, même non déployée. Un registre qui contient des images cassées finit
+  # par servir l'une d'elles.
+  # ═══════════════════════════════════════════════════════════════════════════════
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Types
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          # Valeurs FACTICES, uniquement pour que le build passe : la console lit ses
+          # vraies variables à l'exécution. Un secret réel n'a rien à faire ici — il
+          # se retrouverait dans les journaux publics du workflow.
+          SELLER_BFF_URL: http://localhost:8081
+          SESSION_SECRET: build-only-not-a-real-secret-0123456789
+
+  build-push:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Secrets par environnement : GitHub choisit « prod » ou « staging » selon la branche.
+    environment: ${{ github.ref_name == 'develop' && 'prod' || 'staging' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Préflight — GHCR_TOKEN présent ?
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          if [ -z "$GHCR_TOKEN" ]; then
+            echo "::error::GHCR_TOKEN absent dans CE dépôt → repli sur GITHUB_TOKEN → 403 au push. Ajoutez-le en secret d'environnement."
+            exit 1
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # DEUX étiquettes, et la seconde n'est pas décorative : `:staging` et
+          # `:latest` sont mobiles, `:<sha>` ne l'est pas. C'est la seule façon de
+          # savoir après coup quel commit tourne réellement, et de revenir en arrière
+          # sans reconstruire.
+          tags: |
+            ${{ env.IMAGE }}:${{ env.TAG }}
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  redeploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'develop' && 'prod' || 'staging' }}
+    steps:
+      - name: SSH → pull & up (service seller-console)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 8022 }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            cd "${{ env.APP_DIR }}"
+            COMPOSE_ARGS="-f deploy/${{ env.COMPOSE }} --env-file deploy/.env.${{ env.ENVN }}"
+
+            # sudo : la stack et .env.<env> appartiennent à root (déposés par Ansible),
+            # et root est déjà authentifié auprès de GHCR → le pull d'une image privée
+            # passe.
+            sudo docker compose $COMPOSE_ARGS pull seller-console
+            sudo docker compose $COMPOSE_ARGS up -d seller-console
+
+            # ─────────────────────────────────────────────────────────────────────
+            # ON ATTEND QUE LE CONTENEUR SOIT SAIN, ET LE WORKFLOW ÉCHOUE SINON.
+            #
+            # `up -d` rend la main dès que Docker a lancé le processus, pas quand
+            # l'application répond. Sans cette attente, un démarrage qui échoue —
+            # SELLER_SESSION_SECRET absent, BFF injoignable — remonte en VERT dans
+            # GitHub, et personne ne l'apprend avant qu'un vendeur ne le signale.
+            # ─────────────────────────────────────────────────────────────────────
+            for i in $(seq 1 30); do
+              state=$(sudo docker inspect -f '{{.State.Health.Status}}' \
+                "$(sudo docker compose $COMPOSE_ARGS ps -q seller-console)" 2>/dev/null || echo "unknown")
+              [ "$state" = "healthy" ] && echo "Console vendeur saine." && exit 0
+              [ "$state" = "unhealthy" ] && break
+              sleep 5
+            done
+
+            echo "::error::La console vendeur n'est pas saine après 150 s (état : $state)."
+            sudo docker compose $COMPOSE_ARGS logs --tail=80 seller-console
+            exit 1
