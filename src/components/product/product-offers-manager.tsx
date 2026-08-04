@@ -840,7 +840,10 @@ function CreateOfferDialog({
             <option value="">Choisir…</option>
             {locations.map((l) => (
               <option key={l.id} value={l.id}>
-                {l.line} — {l.city}
+                {/* Même règle que `locationLabel` ailleurs : repère, à défaut la rue.
+                    Sans le repli sur `line`, un lieu hérité sans repère mais avec une
+                    rue se réduisait à sa commune — deux entrepôts devenaient indistincts. */}
+                {l.landmark || l.line ? `${l.communeName} — ${l.landmark || l.line}` : l.communeName}
               </option>
             ))}
           </Select>

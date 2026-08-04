@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
+import { CommuneSelect } from "@/components/commune-select";
 import { formatDateTime, maskAccount } from "@/lib/utils";
 import { accountTone, kybTone, statusLabel } from "@/lib/status-labels";
 import { Badge } from "@/components/ui/badge";
@@ -249,7 +250,7 @@ function CompanyCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => P
     rccm: m?.rccm ?? "",
     ifu: m?.ifu ?? "",
     address: m?.address ?? "",
-    city: m?.city ?? "",
+    commune: m?.commune ?? "",
     activity: m?.activity ?? "",
     managerName: m?.managerName ?? "",
     // Partie LOCALE : l'indicatif est ajouté à l'envoi.
@@ -262,7 +263,7 @@ function CompanyCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => P
       rccm: m?.rccm ?? "",
       ifu: m?.ifu ?? "",
       address: m?.address ?? "",
-      city: m?.city ?? "",
+      commune: m?.commune ?? "",
       activity: m?.activity ?? "",
       managerName: m?.managerName ?? "",
       phone: toLocalPhone(m?.phone),
@@ -339,7 +340,14 @@ function CompanyCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => P
             />
           </div>
           {field("address", "Adresse")}
-          {field("city", "Ville")}
+          {/* Commune choisie dans la liste officielle, comme partout ailleurs.
+              Ce champ reste FACULTATIF : c'est du déclaratif de dossier KYB, pas
+              une adresse de livraison. */}
+          <CommuneSelect
+            value={form.commune}
+            onChange={(code) => setForm((f) => ({ ...f, commune: code }))}
+            label="Commune"
+          />
         </div>
         <div className="flex justify-end">
           {/* Inactif tant que rien n'a changé, comme le profil public : cette route

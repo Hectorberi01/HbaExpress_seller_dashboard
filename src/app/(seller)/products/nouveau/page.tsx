@@ -5,6 +5,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
+import { CommuneSelect } from "@/components/commune-select";
+import { LocationField, type GeoPoint } from "@/components/location-field";
 import { formatXof } from "@/lib/utils";
 import { computeBreakdown } from "@/lib/pricing";
 import { statusLabel } from "@/lib/status-labels";
@@ -87,6 +89,15 @@ let attributeSeq = 0;
  * redemander la saisie que laisser un produit à moitié né dans le catalogue.
  * ─────────────────────────────────────────────────────────────────────────────────
  */
+/**
+ * Libellé court d'un lieu d'expédition : commune + point de repère. Même règle que
+ * dans l'écran Stock — deux libellés différents pour la même donnée sèmeraient le doute.
+ */
+function locationLabel(l: { communeName: string; landmark?: string | null; line?: string | null }): string {
+  const detail = l.landmark || l.line;
+  return detail ? `${l.communeName} — ${detail}` : l.communeName;
+}
+
 export default function NewProductPage() {
   const router = useRouter();
   const qc = useQueryClient();
@@ -791,7 +802,7 @@ export default function NewProductPage() {
                         </option>
                         {locationList.map((l) => (
                           <option key={l.id} value={l.id}>
-                            {l.line} — {l.city}
+                            {locationLabel(l)}
                           </option>
                         ))}
                       </Select>
@@ -927,7 +938,7 @@ export default function NewProductPage() {
                       "Lieu d'expédition",
                       (() => {
                         const l = locationList.find((x) => x.id === locationId);
-                        return l ? `${l.line} — ${l.city}` : "—";
+                        return l ? locationLabel(l) : "—";
                       })(),
                     ],
                     ["Stock initial", onHand.trim()],
@@ -1111,30 +1122,37 @@ function NewLocationDialog({
   /** Reçoit l'identifiant du lieu créé, pour le sélectionner aussitôt. */
   onCreated: (id: string | null) => Promise<void>;
 }) {
+  const [communeCode, setCommuneCode] = useState("");
+  const [quartier, setQuartier] = useState("");
+  const [landmark, setLandmark] = useState("");
+  const [point, setPoint] = useState<GeoPoint | null>(null);
   const [line, setLine] = useState("");
-  const [city, setCity] = useState("");
-  const [country, setCountry] = useState("Bénin");
   const [saving, setSaving] = useState(false);
 
   async function create() {
     setSaving(true);
     let newId: string | null = null;
     try {
-      // Le serveur renvoie `{ locationId }` — PAS `{ id }`. (L'app mobile lit `id`
-      // dans `createLocation` et récupère donc une chaîne vide : le même piège, un
-      // cran plus loin.)
+      // Le serveur renvoie `{ locationId }` — PAS `{ id }`. Lire `id` donnait une
+      // chaîne vide, qui traversait la validation et partait dans l'offre suivante.
+      // (Le même piège existait dans l'app mobile ; il y est corrigé depuis.)
       const created = await bff<{ locationId: string }>("/seller/locations", {
         method: "POST",
         body: JSON.stringify({
-          line: line.trim(),
-          city: city.trim(),
-          country: country.trim(),
-          latitude: null,
-          longitude: null,
+          // « commune » côté serveur : il accepte le code comme le libellé, on envoie le code.
+          commune: communeCode,
+          quartier: quartier.trim() || null,
+          landmark: landmark.trim(),
+          line: line.trim() || null,
+          latitude: point?.latitude ?? null,
+          longitude: point?.longitude ?? null,
         }),
       });
+      setCommuneCode("");
+      setQuartier("");
+      setLandmark("");
+      setPoint(null);
       setLine("");
-      setCity("");
       toastSuccess("Entrepôt créé.");
       newId = created?.locationId ?? null;
     } catch (err) {
@@ -1166,7 +1184,9 @@ function NewLocationDialog({
           </Button>
           <Button
             onClick={create}
-            disabled={saving || !line.trim() || !city.trim() || !country.trim()}
+            // La rue n'entre PAS dans la condition : beaucoup de lieux n'en ont pas.
+            // Ce sont la commune et le repère qui rendent l'entrepôt trouvable.
+            disabled={saving || !communeCode || !landmark.trim()}
           >
             {saving && <Loader2 className="size-4 animate-spin" />}
             Créer
@@ -1174,20 +1194,31 @@ function NewLocationDialog({
         </>
       }
     >
-      <div className="space-y-1.5">
-        <Label htmlFor="loc-line">Adresse</Label>
-        <Input id="loc-line" value={line} onChange={(e) => setLine(e.target.value)} />
-      </div>
+      {/* Mêmes champs, même ordre que l'écran Stock : un vendeur ne doit pas
+          rencontrer deux formulaires différents pour la même chose. */}
+      <CommuneSelect value={communeCode} onChange={setCommuneCode} required />
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
-          <Label htmlFor="loc-city">Ville</Label>
-          <Input id="loc-city" value={city} onChange={(e) => setCity(e.target.value)} />
+          <Label htmlFor="loc-quartier">Quartier</Label>
+          <Input id="loc-quartier" value={quartier} onChange={(e) => setQuartier(e.target.value)} placeholder="Fidjrossè" />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="loc-country">Pays</Label>
-          <Input id="loc-country" value={country} onChange={(e) => setCountry(e.target.value)} />
+          <Label htmlFor="loc-line">Rue, carré (facultatif)</Label>
+          <Input id="loc-line" value={line} onChange={(e) => setLine(e.target.value)} />
         </div>
       </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="loc-landmark">
+          Point de repère<span className="ml-0.5 text-destructive">*</span>
+        </Label>
+        <Input
+          id="loc-landmark"
+          value={landmark}
+          onChange={(e) => setLandmark(e.target.value)}
+          placeholder="En face de la pharmacie Sainte-Rita"
+        />
+      </div>
+      <LocationField value={point} onChange={setPoint} />
     </Dialog>
   );
 }

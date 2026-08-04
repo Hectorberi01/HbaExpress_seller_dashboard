@@ -87,10 +87,16 @@ export interface SellerOrder {
 export interface OrderShippingAddress {
   label?: string | null;
   recipient?: string | null;
+  /** Libellé résolu par le serveur depuis le code figé sur la commande. */
+  communeName?: string | null;
+  communeCode?: string | null;
+  quartier?: string | null;
+  /** Point de repère — vide sur les commandes antérieures à la refonte. */
+  landmark?: string | null;
   line1?: string | null;
-  line2?: string | null;
-  city?: string | null;
-  country?: string | null;
+  /** Position figée par l'acheteur. `null` si elle n'a pas été partagée. */
+  latitude?: number | null;
+  longitude?: number | null;
   phone?: string | null;
 }
 
@@ -324,9 +330,11 @@ export interface FulfillmentLocation {
   /** Toujours « SellerAddress » pour un lieu créé par un vendeur. */
   type: string;
   ownerId?: string | null;
-  line: string;
-  city: string;
-  country: string;
+  communeCode: string;
+  communeName: string;
+  quartier?: string | null;
+  landmark?: string | null;
+  line?: string | null;
   latitude?: number | null;
   longitude?: number | null;
 }
@@ -559,7 +567,10 @@ export interface SellerCompanyInfo {
   rccm?: string | null;
   ifu?: string | null;
   address?: string | null;
-  city?: string | null;
+  /** Code d'une des 77 communes (« abomey-calavi »), pas un libellé libre. */
+  commune?: string | null;
+  /** Libellé accentué, résolu par le serveur — pour l'affichage en lecture seule. */
+  communeName?: string | null;
   activity?: string | null;
   managerName?: string | null;
   phone?: string | null;

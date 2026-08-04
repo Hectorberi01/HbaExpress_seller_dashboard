@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
+import { mapUrl } from "@/components/location-field";
 import { bff } from "@/lib/api";
 import { formatDateTime, formatXof, shortId } from "@/lib/utils";
 import { orderTone, shipmentTone, statusLabel } from "@/lib/status-labels";
@@ -106,7 +107,7 @@ export default function OrderDetailPage() {
   const address = order.shippingAddress;
   const hasAddress =
     address != null &&
-    [address.recipient, address.line1, address.city, address.phone].some(
+    [address.recipient, address.landmark, address.communeName, address.phone].some(
       (v) => v != null && v.trim().length > 0,
     );
 
@@ -261,11 +262,37 @@ export default function OrderDetailPage() {
               ) : (
                 <address className="not-italic leading-relaxed">
                   {address?.recipient && <div className="font-medium">{address.recipient}</div>}
+
+                  {/* LE REPÈRE EN PREMIER, en évidence. C'est l'information que le
+                      coursier utilise réellement — au Bénin, la rue est souvent
+                      inexistante et la commune, il la connaît déjà. */}
+                  {address?.landmark && <div className="font-medium">{address.landmark}</div>}
+
+                  {address?.quartier && <div>{address.quartier}</div>}
                   {address?.line1 && <div>{address.line1}</div>}
-                  {address?.line2 && <div>{address.line2}</div>}
-                  <div className="text-muted-foreground">
-                    {[address?.city, address?.country].filter(Boolean).join(", ") || "—"}
-                  </div>
+                  <div className="text-muted-foreground">{address?.communeName || "—"}</div>
+
+                  {/* ─────────────────────────────────────────────────────────
+                      LE POINT, POUR LE COURSIER.
+
+                      Le livreur n'a pas de compte sur la plateforme. Ce lien est
+                      ce que le vendeur lui transmet — par message, ou en le lui
+                      montrant à la remise du colis.
+
+                      Absent quand l'acheteur n'a pas partagé sa position : le
+                      point de repère, affiché en gras au-dessus, reste la
+                      référence.
+                     ───────────────────────────────────────────────────────── */}
+                  {address?.latitude != null && address?.longitude != null && (
+                    <a
+                      href={mapUrl({ latitude: address.latitude, longitude: address.longitude })}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-2 inline-flex items-center gap-1.5 text-sm text-foreground underline-offset-4 hover:underline"
+                    >
+                      <MapPin className="size-4" /> Ouvrir dans une carte
+                    </a>
+                  )}
                   {address?.label && (
                     <div className="mt-1 text-xs text-muted-foreground">
                       Libellé : {address.label}

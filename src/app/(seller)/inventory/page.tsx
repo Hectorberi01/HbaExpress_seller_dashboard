@@ -10,11 +10,24 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { CommuneSelect } from "@/components/commune-select";
+import { LocationField, mapUrl, type GeoPoint } from "@/components/location-field";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
 import type { FulfillmentLocation, InventoryItem } from "@/types/seller";
 import { AlertTriangle, Loader2, MapPin, PackagePlus, Plus, Search, SlidersHorizontal } from "lucide-react";
+
+/**
+ * Libellé court d'un lieu d'expédition : commune + point de repère.
+ *
+ * Le repère plutôt que la rue, parce que c'est lui qui distingue deux entrepôts
+ * d'une même commune — et parce que beaucoup de lieux n'ont pas de rue.
+ */
+function locationLabel(l: { communeName: string; landmark?: string | null; line?: string | null }): string {
+  const detail = l.landmark || l.line;
+  return detail ? `${l.communeName} — ${detail}` : l.communeName;
+}
 
 export default function InventoryPage() {
   const qc = useQueryClient();
@@ -32,9 +45,11 @@ export default function InventoryPage() {
     queryFn: () => bff<FulfillmentLocation[]>("/seller/locations"),
   });
 
-  const locationLabel = useMemo(() => {
+  // Nommée `locationLabels` (pluriel) : `locationLabel` est la fonction du module.
+  // Réutiliser le même nom la masquait, et `locationLabel(l)` appelait alors la Map.
+  const locationLabels = useMemo(() => {
     const m = new Map<string, string>();
-    for (const l of locations.data ?? []) m.set(l.id, `${l.city} — ${l.line}`);
+    for (const l of locations.data ?? []) m.set(l.id, locationLabel(l));
     return m;
   }, [locations.data]);
 
@@ -176,7 +191,7 @@ export default function InventoryPage() {
                     {/* La localisation peut manquer si la requête « entrepôts » a échoué :
                         on montre l'identifiant court plutôt qu'un tiret, qui laisserait
                         croire à un article orphelin. */}
-                    {locationLabel.get(i.locationId) ?? (
+                    {locationLabels.get(i.locationId) ?? (
                       <span className="font-mono text-xs">{shortId(i.locationId)}</span>
                     )}
                   </TableCell>
@@ -248,9 +263,11 @@ function LocationsDialog({
   failed: boolean;
   onChanged: () => Promise<unknown>;
 }) {
+  const [communeCode, setCommuneCode] = useState("");
+  const [quartier, setQuartier] = useState("");
+  const [landmark, setLandmark] = useState("");
+  const [point, setPoint] = useState<GeoPoint | null>(null);
   const [line, setLine] = useState("");
-  const [city, setCity] = useState("");
-  const [country, setCountry] = useState("Bénin");
   const [confirmDelete, setConfirmDelete] = useState<FulfillmentLocation | null>(null);
 
   const create = useMutation({
@@ -258,16 +275,22 @@ function LocationsDialog({
       bff("/seller/locations", {
         method: "POST",
         body: JSON.stringify({
-          line: line.trim(),
-          city: city.trim(),
-          country: country.trim(),
-          latitude: null,
-          longitude: null,
+          // Le serveur attend « commune » et accepte code ou libellé. On envoie le code.
+          commune: communeCode,
+          quartier: quartier.trim() || null,
+          landmark: landmark.trim(),
+          line: line.trim() || null,
+          // Plus de `null` en dur : la position part quand le vendeur en a posé une.
+          latitude: point?.latitude ?? null,
+          longitude: point?.longitude ?? null,
         }),
       }),
     onSuccess: async () => {
+      setCommuneCode("");
+      setQuartier("");
+      setLandmark("");
+      setPoint(null);
       setLine("");
-      setCity("");
       await onChanged();
     },
     meta: { successMessage: "Entrepôt créé.", errorMessage: "L'entrepôt n'a pas pu être créé." },
@@ -288,7 +311,9 @@ function LocationsDialog({
   });
 
   const busy = create.isPending || remove.isPending;
-  const canCreate = line.trim().length > 0 && city.trim().length > 0 && country.trim().length > 0;
+  // La rue n'est PAS exigée : au Bénin, beaucoup de lieux n'en ont pas. Ce sont la
+  // commune et le point de repère qui rendent l'entrepôt trouvable par un coursier.
+  const canCreate = communeCode.length > 0 && landmark.trim().length > 0;
 
   return (
     <>
@@ -314,9 +339,24 @@ function LocationsDialog({
                 {locations.map((l) => (
                   <div key={l.id} className="flex items-center justify-between gap-2 rounded-lg bg-muted/40 px-3 py-2">
                     <div className="min-w-0">
-                      <div className="truncate text-sm font-medium">{l.line}</div>
+                      <div className="truncate text-sm font-medium">{l.landmark || l.line || l.communeName}</div>
                       <div className="text-xs text-muted-foreground">
-                        {l.city}, {l.country}
+                        {[l.quartier, l.communeName].filter(Boolean).join(", ")}
+                        {/* Le lien n'apparaît que si le lieu porte un point : il sert
+                            au vendeur à vérifier, et à le transmettre au coursier. */}
+                        {l.latitude != null && l.longitude != null && (
+                          <>
+                            {" · "}
+                            <a
+                              href={mapUrl({ latitude: l.latitude, longitude: l.longitude })}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="underline-offset-4 hover:underline"
+                            >
+                              carte
+                            </a>
+                          </>
+                        )}
                       </div>
                     </div>
                     <Button
@@ -335,20 +375,38 @@ function LocationsDialog({
           </div>
 
           <div className="space-y-3 border-t border-border pt-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="line">Adresse</Label>
-              <Input id="line" value={line} onChange={(e) => setLine(e.target.value)} placeholder="Rue, quartier…" />
-            </div>
+            {/*
+              Ordre volontaire, du plus large au plus précis — comme on explique un
+              lieu à un coursier : « Cotonou, Fidjrossè, en face de la pharmacie ».
+              La rue vient en dernier et reste facultative : au Bénin, beaucoup de
+              lieux n'en ont pas, et l'exiger pousserait à en inventer une.
+            */}
+            <CommuneSelect value={communeCode} onChange={setCommuneCode} required />
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <Label htmlFor="city">Ville</Label>
-                <Input id="city" value={city} onChange={(e) => setCity(e.target.value)} />
+                <Label htmlFor="quartier">Quartier</Label>
+                <Input id="quartier" value={quartier} onChange={(e) => setQuartier(e.target.value)} placeholder="Fidjrossè" />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="country">Pays</Label>
-                <Input id="country" value={country} onChange={(e) => setCountry(e.target.value)} />
+                <Label htmlFor="line">Rue, carré (facultatif)</Label>
+                <Input id="line" value={line} onChange={(e) => setLine(e.target.value)} />
               </div>
             </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="landmark">
+                Point de repère<span className="ml-0.5 text-destructive">*</span>
+              </Label>
+              <Input
+                id="landmark"
+                value={landmark}
+                onChange={(e) => setLandmark(e.target.value)}
+                placeholder="En face de la pharmacie Sainte-Rita"
+              />
+              <p className="text-xs text-muted-foreground">
+                C'est ce que lit le coursier qui vient retirer vos colis.
+              </p>
+            </div>
+            <LocationField value={point} onChange={setPoint} />
             <div className="flex justify-end">
               <Button size="sm" onClick={() => create.mutate()} disabled={busy || !canCreate}>
                 {create.isPending && <Loader2 className="size-4 animate-spin" />}
@@ -384,7 +442,7 @@ function LocationsDialog({
           <>
             <p className="text-sm">
               <strong>
-                {confirmDelete.line}, {confirmDelete.city}
+                {locationLabel(confirmDelete)}
               </strong>{" "}
               ne pourra plus servir d&apos;adresse de départ.
             </p>
@@ -506,7 +564,7 @@ function CreateItemDialog({
             <option value="">— Choisir —</option>
             {locations.map((l) => (
               <option key={l.id} value={l.id}>
-                {l.city} — {l.line}
+                {locationLabel(l)}
               </option>
             ))}
           </select>
