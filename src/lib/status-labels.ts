@@ -201,21 +201,47 @@ const TABLES: Record<StatusDomain, Table> = {
   // ─────────────────────────────────────────────────────────────────────────────
   // ShipmentStatus — « expédition », féminin.
   //
-  // ⚠️ DEUX VOCABULAIRES POUR LA MÊME CHOSE, ET LES DEUX SONT ICI.
+  // TROIS ORTHOGRAPHES POUR UN SEUL ÉTAT, ET LES TROIS SONT ICI.
   //
-  // Le domaine dit « Preparing » ; la file d'exécution (`GET /seller/shipments`) le
-  // renomme « Prepared » avant de l'envoyer, alors que le détail
+  // Le domaine dit « Preparing ». La file d'exécution (`GET /seller/shipments`) le
+  // renomme avant de l'envoyer — « Prepared » autrefois, « ReadyForPickup » depuis
+  // (`SellerFulfillmentEndpoints.DashboardStatus`) — pendant que le détail
   // (`GET /seller/shipments/{id}`) renvoie la valeur brute. Le même colis change donc
-  // de mot selon l'écran d'où on le regarde.
+  // de mot selon l'écran d'où on le regarde, et selon la version du serveur en face.
   //
-  // On traduit les deux vers le MÊME libellé français : c'est le seul moyen que la
-  // liste et le détail racontent la même histoire. Corriger l'écart côté serveur
-  // casserait le tableau de bord MAUI qui consomme déjà « Prepared ».
+  // « ReadyForPickup » MANQUAIT, et ce trou ne produisait aucune erreur : `humanize()` rendait
+  // « Ready For Pickup », en anglais, au milieu d'une interface française. La console
+  // ne signalait rien — un libellé absent se lit comme un libellé.
+  //
+  // LES TROIS VONT VERS LE MÊME LIBELLÉ, DÉLIBÉRÉMENT. C'est le seul moyen que la
+  // liste et le détail racontent la même histoire ; leur donner des mots différents
+  // ferait croire à deux étapes là où il n'y en a qu'une. « Prepared » est conservé
+  // pour les serveurs antérieurs au renommage.
+  //
+  // LE LIBELLÉ RESTE « EN PRÉPARATION », ET C'EST UN CHOIX, PAS UN OUBLI.
+  //
+  // Le nom de fil a changé pour de bonnes raisons — « Prepared », participe passé,
+  // faisait lire une tâche finie là où le colis ne fait qu'ATTENDRE d'être enlevé.
+  // La tentation était de suivre côté français avec « En attente d'enlèvement ».
+  //
+  // Elle a été écartée : le bouton qui mène à cet état s'appelle « Marquer en
+  // préparation », et le vendeur doit retrouver dans le badge le mot du geste qu'il
+  // vient de faire. Deux vocabulaires pour une transition et son résultat, c'est le
+  // défaut d'origine reproduit en français. Le présent progressif ne porte d'ailleurs
+  // pas le contresens du participe passé : « en préparation » se lit déjà comme un
+  // état en cours. Ce que le mot ne peut pas dire — que la course est proposée et que
+  // le colis attend un enlèvement — est écrit en toutes lettres sur l'écran des
+  // expéditions, où il y a la place de l'expliquer.
+  //
+  // AUTRE DÉPÔT À NE PAS OUBLIER : l'app vendeur Flutter (HbaExpressPro) consomme le
+  // MÊME BFF et teste « prepared » en dur. Le renommage de fil l'a cassée ; garder
+  // « prepared » ici ne la répare pas — seul son propre code le peut.
   // ─────────────────────────────────────────────────────────────────────────────
   shipmentStatus: {
     pending: "À préparer",
     preparing: "En préparation",
     prepared: "En préparation",
+    readyforpickup: "En préparation",
     shipped: "Expédiée",
     delivered: "Livrée",
     cancelled: "Annulée",
@@ -380,14 +406,34 @@ export function disputeTone(status: string): "success" | "warning" | "danger" | 
 /**
  * Ton du badge pour un statut d'expédition.
  *
- * Accepte les deux orthographes du serveur (« Preparing » et « Prepared »), pour la
- * raison expliquée sur la table `shipmentStatus`.
+ * Accepte les trois orthographes du serveur (« Preparing », « Prepared » et
+ * « ReadyForPickup »), pour la raison expliquée sur la table `shipmentStatus`.
  */
+/**
+ * Les trois orthographes du MÊME état de préparation, en une seule question.
+ *
+ * Le domaine dit « Preparing » ; la file (`GET /seller/shipments`) renvoie
+ * « ReadyForPickup », et « Prepared » sur un serveur antérieur au renommage. Un écran
+ * qui n'en teste qu'une se trompe sur les deux autres, en silence.
+ *
+ * Elle vit ici, et pas dans l'écran des expéditions : le détail d'une commande affiche
+ * les mêmes lignes et pose la même question. Dupliquer le prédicat, c'est accepter que
+ * le prochain renommage n'en corrige qu'une moitié.
+ */
+export function enPreparation(status: string): boolean {
+  const s = status?.toLowerCase() ?? "";
+  return s === "preparing" || s === "prepared" || s === "readyforpickup";
+}
+
 export function shipmentTone(status: string): "success" | "warning" | "danger" | "neutral" {
   const s = status?.toLowerCase() ?? "";
   if (s === "delivered") return "success";
   if (s === "cancelled") return "danger";
-  if (s === "pending" || s === "preparing" || s === "prepared" || s === "shipped") return "warning";
+  // « readyforpickup » est le même état que « preparing » (renommé par la file) : sans
+  // lui, la liste et le détail donnaient au même colis deux couleurs différentes.
+  if (s === "pending" || s === "preparing" || s === "prepared" || s === "readyforpickup" || s === "shipped") {
+    return "warning";
+  }
   return "neutral";
 }
 

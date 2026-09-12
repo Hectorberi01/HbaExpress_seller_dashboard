@@ -56,7 +56,7 @@ function sessionFromTokens(tokens: AuthTokens | null | undefined): SellerSession
 export type LoginResult =
   | { ok: true; session: SellerSession }
   | { ok: false; mfaRequired: true }
-  | { ok: false; mfaRequired?: false; status: number; message: string };
+  | { ok: false; mfaRequired?: false; status: number; message: string; code?: string };
 
 /**
  * POST /seller/auth/login.
@@ -78,6 +78,19 @@ export async function bffLogin(email: string, password: string, mfaCode?: string
     return {
       ok: false,
       status: res.status,
+      // ───────────────────────────────────────────────────────────────────────
+      // LE CODE REMONTE, ET PAS SEULEMENT LE MESSAGE.
+      //
+      // `Results.Problem(title: code, detail: message)` met le CODE dans `title`.
+      // On ne gardait que `detail` — donc la phrase, jamais l'identifiant. Or
+      // « compte suspendu » et « adresse non confirmée » sortent tous deux en 403 :
+      // sans le code, l'écran ne peut pas les distinguer, et il ne lui reste qu'à
+      // reconnaître une phrase française — qui changera.
+      //
+      // C'est ce code qui permet d'orienter un vendeur non vérifié vers la saisie
+      // de son code plutôt que de le laisser devant un mur.
+      // ───────────────────────────────────────────────────────────────────────
+      code: typeof json?.title === "string" ? json.title : undefined,
       message: json?.detail ?? json?.title ?? "Identifiants invalides.",
     };
   }
@@ -261,7 +274,18 @@ export async function bffRegisterSeller(body: {
  * possession de la boîte e-mail prouvée.
  */
 export async function bffVerifySeller(body: {
-  userId: string;
+  /**
+   * L'ADRESSE, ET NON L'IDENTIFIANT.
+   *
+   * `SellerVerifyRequest` prend `Email` depuis septembre 2026, et le commentaire de
+   * `VerifyEmailCodeCommand` dit pourquoi : « c'est ce qui ferme l'oracle
+   * d'énumération ». `/register` ne rend donc plus de `userId` — il n'y a plus rien
+   * à transmettre entre les deux étapes que ce que l'utilisateur a lui-même saisi.
+   *
+   * Cette fonction envoyait encore `userId`. La liaison serveur trouvait `Email`
+   * nul et refusait : l'étape 2 de l'inscription ne pouvait pas aboutir.
+   */
+  email: string;
   code: string;
   shopName: string;
   company?: Record<string, string | null> | null;

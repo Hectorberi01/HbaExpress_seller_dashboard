@@ -49,7 +49,7 @@ export function KybBanner() {
 
   if (shop.isPending || shop.isError || !shop.data) return null;
 
-  const notice = noticeFor(shop.data.kybStatus);
+  const notice = noticeFor(shop.data.kybStatus, shop.data.status);
   if (!notice) return null;
 
   return (
@@ -81,9 +81,43 @@ type Notice = {
  * Un statut INCONNU est traité comme « non vérifié » plutôt qu'ignoré : si la
  * plateforme ajoute un état un jour, mieux vaut un bandeau prudent qu'un silence qui
  * laisserait croire la boutique en règle.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * CE BANDEAU DISAIT QUE LE KYB CONDITIONNE LE VERSEMENT DES GAINS. C'EST FAUX.
+ *
+ * `SellerRights.CanWithdraw` vaut `Active | Pending | Closed | PendingReactivation` —
+ * le KYB n'y figure pas — et `RequestWithdrawalCommandHandler` ne lit jamais
+ * `KybStatus`. Ce que la vérification débloque, c'est `Seller.Activate`, qui refuse
+ * tant que `KybStatus != Verified` ; `Seller.ApproveKyb`, lui, ne fait que poser le
+ * statut vérifié, il n'active rien. Le retrait n'est concerné ni par l'un ni par
+ * l'autre.
+ *
+ * L'ERREUR AVAIT UN COÛT RÉEL, et il tombait au pire moment : un vendeur dont le
+ * retrait vient d'échouer lisait ce bandeau, partait scanner et téléverser des pièces,
+ * attendait la revue — et rien ne se débloquait, le vrai obstacle étant son compte de
+ * versement Mobile Money. Deux démarches longues, dont une pour rien, au moment où il
+ * a besoin de son argent.
+ *
+ * ET LE REMPLACEMENT NE DIT PAS « DONC VOTRE DROIT DE VENDRE » NON PLUS. Première
+ * rédaction de ce correctif, fausse de la même façon : `SellerRights.CanSell` vaut
+ * `Active or Pending`, et `Pending` est EXACTEMENT l'état du vendeur qui lit ce
+ * bandeau. Il peut déjà saisir ses produits, ses déclinaisons, ses offres et son
+ * stock — c'est même le parcours prévu, écrit dans la documentation de `CanSell`. Ce
+ * que la vérification débloque, c'est `Seller.Activate`, donc l'ouverture ; pas la
+ * préparation.
+ * ═══════════════════════════════════════════════════════════════════════════════════
  */
-function noticeFor(status: string | null | undefined): Notice | null {
-  switch ((status ?? "").toLowerCase()) {
+function noticeFor(
+  kybStatus: string | null | undefined,
+  shopStatus: string | null | undefined,
+): Notice | null {
+  // `SellerRights.CanSell` : `Active` et `Pending` écrivent dans leur catalogue, les
+  // trois autres statuts sont refusés en 403. Sans ce test, une boutique SUSPENDUE au
+  // KYB non commencé lisait « préparez votre catalogue dès maintenant » pendant que
+  // chacune de ses écritures était refusée.
+  const peutVendre = ["active", "pending"].includes((shopStatus ?? "").toLowerCase());
+
+  switch ((kybStatus ?? "").toLowerCase()) {
     case "verified":
       return null;
 
@@ -114,7 +148,10 @@ function noticeFor(status: string | null | undefined): Notice | null {
         title: "Votre boutique n'est pas encore vérifiée.",
         body:
           "Déposez vos pièces justificatives dans Ma boutique, section Documents KYB. " +
-          "La vérification conditionne le versement de vos gains.",
+          "La vérification conditionne l'activation de votre boutique." +
+          (peutVendre
+            ? " Vous pouvez préparer votre catalogue dès maintenant : c'est l'ouverture qui attend vos pièces."
+            : ""),
         icon: ShieldAlert,
         className:
           "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200",

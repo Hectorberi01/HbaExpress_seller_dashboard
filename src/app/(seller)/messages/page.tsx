@@ -13,7 +13,7 @@ import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
 import { ImageViewer } from "@/components/image-viewer";
 import { MESSAGE_REACTIONS, type SellerConversation, type SellerMessage } from "@/types/seller";
-import { Check, CheckCheck, EyeOff, ImagePlus, Loader2, MessagesSquare, Send, Trash2, X } from "lucide-react";
+import { AlertTriangle, Check, CheckCheck, EyeOff, ImagePlus, Loader2, MessagesSquare, Send, Trash2, X } from "lucide-react";
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────────
@@ -59,6 +59,31 @@ export default function MessagesPage() {
   const qc = useQueryClient();
   const [openId, setOpenId] = useState<string | null>(null);
 
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * LE FIL DEMANDÉ PAR L'URL (`/messages?c=…`).
+   *
+   * Cet écran n'avait aucune entrée : la sélection était un état local, posé sur le
+   * fil le plus récent. Le bouton « Écrire au client » d'une fiche commande y
+   * aboutissait donc en ouvrant la conversation d'un AUTRE client, sans que rien ne
+   * le signale.
+   *
+   * `window.location.search` plutôt que `useSearchParams()` : le second force le
+   * rendu dynamique de la page et réclame une frontière `Suspense`, pour une lecture
+   * qui n'a lieu qu'une fois au montage. Même choix, et pour la même raison, que
+   * l'écran d'inscription.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const demande = useRef<string | null>(null);
+  const [filIntrouvable, setFilIntrouvable] = useState(false);
+
+  useEffect(() => {
+    demande.current = new URLSearchParams(window.location.search).get("c");
+    // Au montage uniquement. Lire pendant le rendu ferait diverger serveur et client
+    // au premier passage ; une `ref` n'entraîne par ailleurs aucun re-rendu, la
+    // sélection est faite par l'effet ci-dessous qui tourne après.
+  }, []);
+
   const conversations = useQuery({
     queryKey: ["seller-conversations"],
     queryFn: () => bff<SellerConversation[]>("/seller/conversations"),
@@ -80,16 +105,40 @@ export default function MessagesPage() {
   const current = rows.find((c) => c.id === openId) ?? null;
 
   useEffect(() => {
-    if (rows.length === 0) return;
+    if (rows.length === 0) {
+      // LISTE VIDE ET LIEN DEMANDÉ : c'est aussi un lien non honoré, et le cas était
+      // passé sous silence par le `return` — aucun fil affiché, aucun avertissement.
+      // On attend d'être sûr : tant que la requête tourne ou qu'elle a échoué, on ne
+      // sait pas si le fil existe.
+      if (demande.current && !conversations.isLoading && !conversations.isError) {
+        setFilIntrouvable(true);
+      }
+      return;
+    }
     // On sélectionne au premier remplissage — et de nouveau si le fil ouvert a disparu
     // de la liste, faute de quoi le panneau droit restait vide pour de bon.
     if (openId === null && !autoSelected.current) {
       autoSelected.current = true;
-      setOpenId(rows[0].id);
+      // ═══════════════════════════════════════════════════════════════════════════
+      // LE FIL DEMANDÉ PAR L'URL GAGNE — ET S'IL EST INTROUVABLE, ON LE DIT.
+      //
+      // Le repli silencieux sur le fil le plus récent reproduisait exactement le
+      // défaut qu'on ferme ici : le vendeur clique un lien précis et atterrit dans la
+      // conversation d'un autre client, sans rien pour le lui signaler.
+      //
+      // « Disparu » ne veut pas dire archivé ni supprimé, contrairement à ce que
+      // disait la première rédaction : `ListByParticipantAsync` ne filtre pas le
+      // statut — un fil archivé RESTE dans la liste — et aucune suppression de
+      // conversation n'existe dans le domaine. Le cas réel est un identifiant erroné,
+      // périmé, ou d'un fil dont ce vendeur n'est pas participant.
+      // ═══════════════════════════════════════════════════════════════════════════
+      const vise = rows.find((c) => c.id === demande.current);
+      if (!vise && demande.current) setFilIntrouvable(true);
+      setOpenId(vise?.id ?? rows[0].id);
       return;
     }
     if (openId !== null && current === null) setOpenId(rows[0].id);
-  }, [rows, openId, current]);
+  }, [rows, openId, current, conversations.isLoading, conversations.isError]);
 
   return (
     <div className="p-6 lg:p-8">
@@ -107,6 +156,33 @@ export default function MessagesPage() {
       </PageNote>
 
       <QueryError of={conversations} />
+
+      {filIntrouvable && (
+        <Card className="mb-4 p-4 text-sm">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <div className="min-w-0 flex-1">
+              {/* LE BANDEAU DOIT POUVOIR PARTIR. Sans cela il restait affiché pour
+                  toute la vie du composant, et sa dernière phrase devenait fausse dès
+                  que le vendeur choisissait un fil à la main : ce n'était plus « le
+                  plus récent », c'était le sien. */}
+              <p className="text-muted-foreground">
+                La conversation que vous avez ouverte depuis un lien est introuvable — elle a pu
+                changer, ou vous n&apos;en faites pas partie.
+                {rows.length > 0 && " Un autre fil est affiché à la place."}
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-3"
+                onClick={() => setFilIntrouvable(false)}
+              >
+                J&apos;ai compris
+              </Button>
+            </div>
+          </div>
+        </Card>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-1">
@@ -128,7 +204,12 @@ export default function MessagesPage() {
                   <li key={c.id}>
                     <button
                       type="button"
-                      onClick={() => setOpenId(c.id)}
+                      onClick={() => {
+                    setOpenId(c.id);
+                    // Le vendeur vient de choisir lui-même : l'avertissement sur le
+                    // fil introuvable a fait son office.
+                    setFilIntrouvable(false);
+                  }}
                       className={`flex w-full items-start gap-3 p-4 text-left transition-colors hover:bg-accent ${
                         c.id === openId ? "bg-accent" : ""
                       }`}
@@ -325,6 +406,21 @@ function Thread({
     onSuccess: async () => {
       setConfirming(null);
       await refreshThread();
+      // ═══════════════════════════════════════════════════════════════════════════
+      // MASQUER TOUCHE AUSSI LA COLONNE DE GAUCHE, ET ELLE NE BOUGEAIT PAS.
+      //
+      // Seul `refreshThread()` était appelé — la clé du fil — là où la suppression
+      // pour tous appelle EN PLUS `onChanged()`, qui invalide la liste des
+      // conversations. Or le résumé de conversation est construit APRÈS filtrage des
+      // messages masqués (`ConversationQueries` : `Where(m => !m.IsHiddenFor(viewerId))`),
+      // et c'est sur cette liste filtrée que le BFF calcule `lastMessage` et le
+      // compteur de non-lus.
+      //
+      // Après avoir masqué le dernier message d'un fil, l'aperçu continuait donc de
+      // l'afficher jusqu'au cycle de rafraîchissement suivant : le geste paraissait
+      // sans effet sur la moitié de l'écran, celle que le vendeur regarde en premier.
+      // ═══════════════════════════════════════════════════════════════════════════
+      await onChanged();
     },
     meta: { successMessage: "Message masqué de votre vue.", errorMessage: "Le masquage a échoué." },
   });
@@ -332,15 +428,39 @@ function Thread({
   // `upload.isPending` compte : sans lui, envoyer avant la fin du téléversement partait
   // SANS la pièce jointe, puis `upload.onSuccess` recollait l'image dans un brouillon
   // désormais vide — une vignette orpheline pour un message déjà parti.
-  const canSend = (body.trim().length > 0 || attachments.length > 0) && !upload.isPending;
+  // Statut absent = fil ouvert : un serveur qui ne projette pas encore le champ ne
+  // doit pas verrouiller toutes les conversations.
+  //
+  // `Conversation` expose DEUX fermetures — `Archive()` et `Block()` — et elles ne se
+  // racontent pas pareil : « l'un ou l'autre des participants a pu l'archiver » serait
+  // faux sur un fil bloqué. On les distingue donc à l'écran.
+  const statutFil = (conversation.status ?? "Open").toLowerCase();
+  const filClos = statutFil !== "open";
+  const filBloque = statutFil === "blocked";
+
+  // ON N'INVITE PAS À « OUVRIR UN NOUVEAU FIL » : le BFF vendeur ne monte AUCUNE route
+  // de création de conversation (seulement la liste, les messages, les pièces jointes
+  // et les réactions), et aucun écran ne le propose. C'était une consigne que le
+  // vendeur ne pouvait pas exécuter.
+
+  const canSend =
+    !filClos && (body.trim().length > 0 || attachments.length > 0) && !upload.isPending;
 
   return (
     <CardContent className="flex h-[70vh] flex-col p-0">
       <div className="flex items-center justify-between gap-2 border-b border-border px-5 py-3">
         <div className="min-w-0">
           <div className="truncate font-medium">{conversation.customer}</div>
+          {/* `subject` vaut `ContextType`, une chaîne LIBRE écrite par le client qui
+              a ouvert le fil : jamais validée, bornée par la seule colonne. Rendue
+              telle quelle sous « À propos de : », elle prenait l'apparence d'un
+              libellé de la plateforme — un acheteur pouvait donc faire écrire ce
+              qu'il voulait à un endroit qui a l'air d'être de nous. Les guillemets et
+              la mention « indiqué par le client » rendent la source au texte. */}
           {conversation.subject && (
-            <div className="text-xs text-muted-foreground">À propos de : {conversation.subject}</div>
+            <div className="truncate text-xs text-muted-foreground">
+              Sujet indiqué par le client : «&nbsp;{conversation.subject}&nbsp;»
+            </div>
           )}
         </div>
         {/* Seulement au PREMIER chargement : un spinner qui clignote toutes les huit
@@ -352,13 +472,17 @@ function Thread({
         {messages.isLoading ? (
           <p className="text-center text-sm text-muted-foreground">Chargement…</p>
         ) : messages.isError ? (
+          // LE BOUTON « RÉESSAYER » DOUBLONNAIT UNE REPRISE AUTOMATIQUE. Ce fil a un
+          // `refetchInterval` de huit secondes : la console retente d'elle-même, et
+          // proposer un geste que la page accomplit déjà, c'est demander au vendeur de
+          // faire le travail d'une horloge. On le dit plutôt que de l'occuper.
           <div className="text-center text-sm">
             <p className="text-muted-foreground">
               Ce fil n&apos;a pas pu être chargé. Il n&apos;est pas vide, il est inconnu.
             </p>
-            <Button size="sm" variant="outline" className="mt-3" onClick={refreshThread}>
-              Réessayer
-            </Button>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Nouvelle tentative automatique dans quelques secondes.
+            </p>
           </div>
         ) : list.length === 0 ? (
           <p className="text-center text-sm text-muted-foreground">
@@ -411,6 +535,38 @@ function Thread({
           </div>
         )}
 
+        {/* ═══════════════════════════════════════════════════════════════════════
+            UN FIL ARCHIVÉ GARDAIT SA ZONE DE SAISIE, ET LE SERVEUR REFUSAIT À L'ENVOI.
+
+            `Conversation.SendMessage` refuse en 409 dès que le statut n'est pas
+            `Open`. L'archivage est accessible à N'IMPORTE QUEL participant — donc à
+            l'acheteur — et `Conversation` n'expose AUCUNE méthode de réouverture. Le
+            vendeur rédigeait sa réponse dans un champ ouvert, cliquait, et recevait
+            une erreur technique sur un fil qu'il n'avait pas fermé lui-même.
+
+            Le statut n'était pas projeté par le BFF ; il l'est désormais. Un statut
+            ABSENT est traité comme ouvert : un serveur antérieur à cette projection ne
+            doit pas condamner toutes les conversations.
+            ═══════════════════════════════════════════════════════════════════════ */}
+        {filClos ? (
+          <p className="rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
+            {filBloque ? (
+              <>
+                Cette conversation est <strong>bloquée</strong> : elle n&apos;accepte plus aucun
+                message. Rien ne permet de la rouvrir depuis la console. Si vous pensez que
+                c&apos;est une erreur, écrivez à l&apos;assistance.
+              </>
+            ) : (
+              <>
+                Cette conversation est <strong>archivée</strong> : elle n&apos;accepte plus aucun
+                message. L&apos;un ou l&apos;autre des participants a pu l&apos;archiver, et rien
+                ne permet de la rouvrir depuis la console. Pour reprendre contact, passez par
+                l&apos;assistance ou attendez que le client ouvre un nouveau fil depuis son
+                application.
+              </>
+            )}
+          </p>
+        ) : (
         <div className="flex items-end gap-2">
           <input
             ref={fileRef}
@@ -451,7 +607,10 @@ function Thread({
             {send.isPending ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
           </Button>
         </div>
-        <p className="text-[11px] text-muted-foreground">Entrée pour envoyer, Maj + Entrée pour aller à la ligne.</p>
+        )}
+        {!filClos && (
+          <p className="text-[11px] text-muted-foreground">Entrée pour envoyer, Maj + Entrée pour aller à la ligne.</p>
+        )}
       </div>
 
       <Dialog

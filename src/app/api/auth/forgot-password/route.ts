@@ -16,7 +16,7 @@ export async function POST(req: Request) {
   // Frein anti-force-brute, par IP réelle. Voir `lib/rate-limit.ts` : le
   // quota du BFF est aveugle derrière ce proxy, il compte tous les vendeurs
   // comme un seul client.
-  const limited = rateLimit(req as NextRequest, "auth-forgot", 3);
+  const limited = rateLimit(req as NextRequest, "auth-forgot", 15);
   if (limited) return limited;
 
   const body = (await req.json().catch(() => ({}))) as { email?: string };

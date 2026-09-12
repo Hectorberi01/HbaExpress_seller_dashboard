@@ -17,25 +17,29 @@ export async function POST(req: Request) {
   // Frein anti-force-brute, par IP réelle. Voir `lib/rate-limit.ts` : le
   // quota du BFF est aveugle derrière ce proxy, il compte tous les vendeurs
   // comme un seul client.
-  const limited = rateLimit(req as NextRequest, "auth-verify", 10);
+  const limited = rateLimit(req as NextRequest, "auth-verify", 30);
   if (limited) return limited;
 
   const body = (await req.json().catch(() => ({}))) as {
-    userId?: string;
+    email?: string;
     code?: string;
     shopName?: string;
     company?: Record<string, string | null> | null;
   };
 
-  if (!body.userId || !body.code || !body.shopName) {
+  // L'ADRESSE, ET NON L'IDENTIFIANT — `SellerVerifyRequest` prend `Email` depuis que
+  // le serveur a fermé son oracle d'énumération. Cette route exigeait `userId` et
+  // refusait en 400 sans lui, alors que `/register` ne le rend plus : l'étape 2 était
+  // inatteignable même en la sollicitant directement.
+  if (!body.email || !body.code || !body.shopName) {
     return NextResponse.json(
-      { error: "Identifiant, code et nom de boutique sont requis." },
+      { error: "Adresse e-mail, code et nom de boutique sont requis." },
       { status: 400 },
     );
   }
 
   const res = await bffVerifySeller({
-    userId: body.userId,
+    email: body.email,
     code: body.code,
     shopName: body.shopName,
     company: body.company ?? null,

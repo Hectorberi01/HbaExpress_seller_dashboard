@@ -15,7 +15,17 @@ import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
-import type { SellerOrder } from "@/types/seller";
+import { ChartFrame } from "@/components/charts/chart-frame";
+import { SerieTemporelle } from "@/components/charts/charts";
+import { PeriodePresets } from "@/components/charts/period-presets";
+import {
+  borneLocale,
+  decalageMinutesVersEst,
+  formatJourCourt,
+  formatJourLong,
+  jourLocal,
+} from "@/lib/series";
+import type { SellerOrder, SellerOrderSeries } from "@/types/seller";
 import { ChevronLeft, ChevronRight, Search } from "lucide-react";
 
 const PAGE_SIZE = 25;
@@ -25,6 +35,7 @@ export default function OrdersPage() {
   const [page, setPage] = useState(1);
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
+  const [jours, setJours] = useState(30);
 
   const params = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
   if (search.trim()) params.set("search", search.trim());
@@ -36,6 +47,36 @@ export default function OrdersPage() {
   });
 
   const rows = q.data ?? [];
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // LA COURBE NE SE DÉDUIT PAS DU TABLEAU, ET C'EST TOUT LE POINT.
+  //
+  // Le tableau ci-dessous est PAGINÉ : vingt-cinq lignes, triées par date. Tracer
+  // leur répartition aurait produit une courbe d'allure crédible qui ne décrit que la
+  // page affichée — et qui change de forme quand on tourne la page. Un graphe faux
+  // est pire qu'une absence de graphe : on le croit.
+  //
+  // `/seller/orders/series` agrège côté serveur sur TOUTES les commandes de la
+  // période, jours vides compris, dans le fuseau du vendeur. La recherche n'entre pas
+  // dans la courbe : « commandes du mois » et « commandes dont la référence contient
+  // a1b2 » sont deux questions, et les mélanger donnerait une évolution filtrée que
+  // rien à l'écran n'annoncerait.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const du = jourLocal(jours - 1);
+  const au = jourLocal(0);
+  const serie = useQuery({
+    queryKey: ["seller-orders-series", du, au],
+    queryFn: () =>
+      bff<SellerOrderSeries>(
+        `/seller/orders/series?from=${encodeURIComponent(borneLocale(du, false))}` +
+          `&to=${encodeURIComponent(borneLocale(au, true))}` +
+          `&offsetMinutes=${decalageMinutesVersEst()}`,
+      ),
+    placeholderData: keepPreviousData,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const points = serie.data?.points ?? [];
 
   // ───────────────────────────────────────────────────────────────────────────────
   // PAGINATION SANS TOTAL — ET ON LE DIT.
@@ -61,7 +102,9 @@ export default function OrdersPage() {
       <header className="mb-6">
         <h1 className="text-2xl font-semibold tracking-tight">Commandes</h1>
         <p className="text-sm text-muted-foreground">
-          {q.isLoading ? "Chargement…" : `Page ${page} — ${rows.length} commande(s) affichée(s)`}
+          {/* Le numéro de page est déjà au pied du tableau, à côté des boutons qui le
+              changent — c'est là qu'il sert. L'en-tête se contente du décompte. */}
+          {q.isLoading ? "Chargement…" : `${rows.length} commande(s) affichée(s)`}
         </p>
       </header>
 
@@ -72,6 +115,52 @@ export default function OrdersPage() {
       </PageNote>
 
       <QueryError of={q} />
+
+      {/* ═══════════════════════════════════════════════════════════════════════════
+          LA RANGÉE DE PÉRIODE NE CADRE QUE LA COURBE, ET IL FAUT QUE ÇA SE VOIE.
+
+          Posée en tête d'écran, elle chapeautait visuellement la courbe ET le tableau
+          — qu'elle ne filtre pas. On lisait alors « Période 7 jours », « 25
+          commande(s) affichée(s) » et « 3 commande(s) sur la période » sur le même
+          écran : trois chiffres exacts dont aucun n'expliquait les deux autres.
+
+          Elle est donc enfermée dans le même bloc que la courbe, et la note de la
+          carte dit explicitement que le tableau n'en dépend pas.
+          ═══════════════════════════════════════════════════════════════════════════ */}
+      <div className="mb-6">
+        <PeriodePresets jours={jours} onChange={setJours} className="mb-2" />
+        <ChartFrame
+          titre="Évolution des commandes"
+          description={
+            serie.data
+              ? `${serie.data.totalOrders} commande(s) sur la période, annulations comprises.`
+              : undefined
+          }
+          chargement={serie.isLoading}
+          erreur={serie.isError ? (serie.error as Error).message : null}
+          rafraichit={serie.isFetching && !serie.isLoading}
+          colonnes={["Jour", "Commandes", "dont annulées"]}
+          lignes={points.map((p) => [formatJourLong(p.date), p.orders, p.cancelled])}
+          note={
+            <>
+              Toutes vos commandes de la période, indépendamment de la recherche et de la page
+              affichée. <strong>Le tableau ci-dessous ne suit pas cette période</strong> : il
+              liste vos commandes les plus récentes, page par page.
+            </>
+          }
+        >
+          <SerieTemporelle
+            donnees={points}
+            cleX="date"
+            series={[
+              { cle: "orders", libelle: "Commandes" },
+              { cle: "cancelled", libelle: "dont annulées" },
+            ]}
+            formatX={formatJourCourt}
+            formatValeur={(v) => String(v)}
+          />
+        </ChartFrame>
+      </div>
 
       <form onSubmit={submitSearch} className="mb-4 flex gap-2">
         <div className="relative flex-1 sm:max-w-xs">
@@ -108,8 +197,24 @@ export default function OrdersPage() {
               <TableHead>Référence</TableHead>
               <TableHead>Client</TableHead>
               <TableHead>Date</TableHead>
+              {/* ═══════════════════════════════════════════════════════════════
+                  LA COLONNE « PAIEMENT » NE DISAIT RIEN QUE « STATUT » NE DISE DÉJÀ.
+
+                  Côté BFF, `paymentStatus = ToPaymentStatus(o.Status)` — une fonction
+                  PURE du statut de commande : payé/confirmé/livré → « Payé »,
+                  annulé/échoué → « Échoué », tout le reste → « En attente ». Aucune
+                  donnée de paiement n'est lue.
+
+                  Deux badges côte à côte sur vingt-cinq lignes, dont le second est
+                  calculé à partir du premier : le vendeur balayait deux colonnes en
+                  croyant y lire deux faits indépendants, et « Annulée / Échoué » lui
+                  faisait soupçonner un problème de paiement là où il n'y en a pas.
+
+                  À REMETTRE le jour où le BFF relaiera un statut de paiement réellement
+                  distinct — le module Payments en tient un, il n'est simplement pas
+                  projeté jusqu'ici.
+                  ═══════════════════════════════════════════════════════════════ */}
               <TableHead>Statut</TableHead>
-              <TableHead>Paiement</TableHead>
               <TableHead className="text-right">Votre total</TableHead>
               <TableHead className="w-12" />
             </TableRow>
@@ -117,7 +222,7 @@ export default function OrdersPage() {
           <TableBody>
             {q.isLoading ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
                   Chargement…
                 </TableCell>
               </TableRow>
@@ -125,13 +230,13 @@ export default function OrdersPage() {
               // Le bandeau QueryError dit déjà pourquoi ; on évite juste de laisser
               // croire à une liste vide.
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
                   Liste non chargée.
                 </TableCell>
               </TableRow>
             ) : rows.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
                   {search ? "Aucune commande ne correspond à cette recherche." : "Aucune commande pour l'instant."}
                 </TableCell>
               </TableRow>
@@ -170,9 +275,6 @@ export default function OrdersPage() {
                   <TableCell className="text-sm text-muted-foreground">{formatDateTime(o.createdAtUtc)}</TableCell>
                   <TableCell>
                     <Badge variant={orderTone(o.status)}>{statusLabel(o.status, "order")}</Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="neutral">{statusLabel(o.paymentStatus, "payment")}</Badge>
                   </TableCell>
                   <TableCell className="text-right font-medium tabular-nums">{formatXof(o.grandTotal)}</TableCell>
                   <TableCell className="text-muted-foreground">

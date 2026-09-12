@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
+import { useAutoChoisirUnique } from "@/lib/auto-choice";
 import { CommuneSelect } from "@/components/commune-select";
 import { LocationField, type GeoPoint } from "@/components/location-field";
 import { formatXof } from "@/lib/utils";
@@ -20,6 +21,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
 import { CategoryPicker } from "@/components/product/category-picker";
+import {
+  CategoryAttributesForm,
+  attributsANEnvoyer,
+  attributsValides,
+  obligatoiresManquants,
+  problemeAttribut,
+  type ValeursAttributs,
+} from "@/components/product/category-attributes-form";
 import { PriceBreakdown, usePricingRates } from "@/components/product/price-breakdown";
 import { categoryReadablePath } from "@/lib/categories";
 import { Dialog } from "@/components/ui/dialog";
@@ -36,11 +45,11 @@ import {
 } from "@/components/product/product-images-field";
 import type {
   FulfillmentLocation,
-  SellerBrand,
   SellerCategory,
   SellerShop,
 } from "@/types/seller";
 import {
+  AlertTriangle,
   ArrowLeft,
   Check,
   ChevronDown,
@@ -50,10 +59,24 @@ import {
   Plus,
   X,
 } from "lucide-react";
+import { peutVendre, raisonDeRefus } from "@/lib/selling";
 
-const STEPS = ["Produit", "Déclinaison", "Vente & stock", "Récapitulatif"] as const;
-
-const HANDLING_TIMES = [1, 2, 3, 5];
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * L'ÉTAPE « DÉCLINAISON » NE DEMANDAIT RIEN, ET ON LA TRAVERSAIT D'UN CLIC.
+ *
+ * Elle ne portait qu'un champ visible, le SKU — déjà pré-rempli au format de la
+ * plateforme — au-dessus d'un bloc replié dont le seul champ obligatoire, le poids,
+ * vaut déjà « 0 ». Sur chaque produit créé, le vendeur lisait une page et cliquait
+ * « Continuer » sans avoir rien saisi.
+ *
+ * LE SKU REJOINT « VENTE & STOCK », et c'est sa place : c'est la référence qu'il
+ * retrouvera sur ses offres, son stock et ses commandes — précisément ce que cette
+ * étape met en place. Le bloc « Attributs de la déclinaison » reste replié à côté, pour
+ * qui vend en plusieurs tailles ou couleurs.
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ */
+const STEPS = ["Produit", "Vente & stock", "Récapitulatif"] as const;
 
 /**
  * Format exigé par `Sku.Create` côté serveur : lettres, chiffres, tirets, underscores,
@@ -114,36 +137,74 @@ export default function NewProductPage() {
   const [description, setDescription] = useState("");
   const [images, setImages] = useState<DraftImage[]>([]);
   const [imagesTouched, setImagesTouched] = useState(false);
-  const [brandId, setBrandId] = useState("");
-  const [gtin, setGtin] = useState("");
-  const [ean, setEan] = useState("");
-  const [tags, setTags] = useState("");
-  const [moreInfo, setMoreInfo] = useState(false);
+  /**
+   * ═════════════════════════════════════════════════════════════════════════════════
+   * CINQ CHAMPS ONT QUITTÉ CET ASSISTANT. CE QU'ILS SONT DEVENUS.
+   *
+   * L'audit a posé une seule question à chacun : QUI LIT CETTE VALEUR ENSUITE ?
+   *
+   *   PLUS DEMANDÉS NULLE PART DANS CETTE CONSOLE — aucune fonction ne les lit :
+   *     - EAN : doublon de GTIN. Même type, même nettoyage, même colonne
+   *       (`HasMaxLength(14)` pour les deux), et le seul contrôle serveur est une
+   *       longueur maximale identique pour les deux. La fiche produit n'expose plus
+   *       qu'un champ « Code-barres du produit », qui lit l'une ou l'autre colonne.
+   *       (La donnée reste en base, l'admin continue de l'afficher, et l'app mobile
+   *       vendeur demande toujours les deux champs séparément — c'est un écart entre
+   *       les deux clients, à traiter le jour où le mobile sera repris.)
+   *     - Code-barres de déclinaison : projeté jusqu'au contrat et jamais consommé —
+   *       ni scan, ni recherche, ni affichage acheteur, ni affichage admin. La valeur
+   *       déjà saisie est reconduite à chaque enregistrement, jamais effacée.
+   *
+   *   DÉPLACÉS SUR LA FICHE PRODUIT — lus par quelqu'un, mais corrigeables ensuite,
+   *   donc sans raison de barrer la route de la première mise en vente :
+   *     - Marque (lue par l'admin), GTIN, mots-clés, poids, délai de préparation.
+   *
+   * Le poids devient FACULTATIF au passage : il était obligatoire ici, et il n'entre
+   * dans aucun calcul — `ShippingRate` est un forfait par commune de destination, qui
+   * ne dépend « ni du poids, ni du volume, ni du nombre d'articles ».
+   *
+   * Les champs correspondants restent dans le domaine et en base : on retire ce qu'on
+   * DEMANDE, pas ce qui est stocké. Les valeurs déjà saisies sont donc intactes, et la
+   * fiche produit les rend toutes modifiables.
+   * ═════════════════════════════════════════════════════════════════════════════════
+   */
 
-  // ── Étape 2 : déclinaison ──
+  /**
+   * ═════════════════════════════════════════════════════════════════════════════════
+   * CARACTÉRISTIQUES DE LA CATÉGORIE — L'ASSISTANT N'EN ENVOYAIT AUCUNE.
+   *
+   * Le `FormData` portait `categoryId`, `name`, `description`, `brandId`, `gtin`,
+   * `ean`, `tags` et `images`, jamais `attributesJson` — que le serveur accepte
+   * pourtant depuis toujours. Dès que l'administration pose un attribut obligatoire
+   * sur une catégorie, `CategoryAttributeSchema.Validate` refusait donc TOUTE création
+   * dans cette catégorie, et le refus arrivait après le téléversement des photos.
+   * Impasse complète, sans un seul champ à l'écran pour satisfaire la règle.
+   *
+   * LES VALEURS SONT VIDÉES QUAND LA CATÉGORIE CHANGE. Les clés d'un schéma n'ont
+   * aucun sens dans un autre : les garder enverrait des attributs « inattendus » dans
+   * une catégorie fermée, c'est-à-dire un refus que le vendeur ne pourrait pas
+   * expliquer — il n'aurait jamais vu ces champs.
+   * ═════════════════════════════════════════════════════════════════════════════════
+   */
+  const [attributsCategorie, setAttributsCategorie] = useState<ValeursAttributs>({});
+
+  // ── Déclinaison : saisie dans l'étape 2, avec la mise en vente ──
   const [sku, setSku] = useState("");
   const [skuTouched, setSkuTouched] = useState(false);
-  const [barcode, setBarcode] = useState("");
-  const [weight, setWeight] = useState("0");
   const [attributes, setAttributes] = useState<AttributeRow[]>([]);
   const [variantOptions, setVariantOptions] = useState(false);
 
-  // ── Étape 3 : mise en vente et stock ──
+  // ── Mise en vente et stock : seconde moitié de l'étape 2 ──
   const [condition, setCondition] = useState("New");
   const [sellerPrice, setSellerPrice] = useState("");
   const [locationId, setLocationId] = useState("");
   const [onHand, setOnHand] = useState("1");
   const [threshold, setThreshold] = useState("0");
-  const [handlingTime, setHandlingTime] = useState("2");
   const [creatingLocation, setCreatingLocation] = useState(false);
 
   const categories = useQuery({
     queryKey: ["seller-categories"],
     queryFn: () => bff<SellerCategory[]>("/seller/categories"),
-  });
-  const brands = useQuery({
-    queryKey: ["seller-brands"],
-    queryFn: () => bff<SellerBrand[]>("/seller/brands"),
   });
   const locations = useQuery({
     queryKey: ["seller-locations"],
@@ -190,6 +251,9 @@ export default function NewProductPage() {
 
   const locationList = locations.data ?? [];
 
+  // Un seul entrepôt : on le pose, plutôt que de faire ouvrir une liste d'un.
+  useAutoChoisirUnique(locationId, setLocationId, locationList.map((l) => l.id));
+
   // ───────────────────────────────────────────────────────────────────────────────
   // LIBÉRATION DES APERÇUS À LA SORTIE DE LA PAGE.
   //
@@ -220,6 +284,13 @@ export default function NewProductPage() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [saving]);
 
+  // Schéma de la catégorie choisie. Le serveur l'envoie avec chaque catégorie ; il
+  // suffit de le retrouver dans la liste déjà chargée.
+  const categorieChoisie = (categories.data ?? []).find((c) => c.id === categoryId);
+  const schemaCategorie = categorieChoisie?.attributeSchema ?? [];
+  /** Vrai quand la catégorie refuse toute clé hors schéma. Voir la note près du champ. */
+  const categorieFermee = categorieChoisie?.allowUnknownAttributes === false;
+
   // ── Validation, étape par étape (mêmes règles que l'app mobile) ──
   function validate(target: number): string | null {
     if (target === 0) {
@@ -232,24 +303,40 @@ export default function NewProductPage() {
       if (totalImageBytes(images) > MAX_TOTAL_BYTES)
         return `Vos photos pèsent trop lourd au total (${MAX_TOTAL_BYTES / 1024 / 1024} Mo au maximum). Retirez-en ou allégez-les.`;
       if (images.some((i) => i.processing)) return "Un détourage est encore en cours.";
+
+      // On arrête ICI, avant le téléversement des photos, ce que le serveur aurait
+      // refusé après. C'est tout l'intérêt : le refus tardif était l'essentiel du mal.
+      const manquants = obligatoiresManquants(schemaCategorie, attributsCategorie);
+      if (manquants.length > 0) {
+        return manquants.length === 1
+          ? `« ${manquants[0]} » est obligatoire dans cette catégorie.`
+          : `Ces caractéristiques sont obligatoires dans cette catégorie : ${manquants.join(", ")}.`;
+      }
+      if (!attributsValides(schemaCategorie, attributsCategorie)) {
+        const premier = schemaCategorie
+          .map((def) => problemeAttribut(def, attributsCategorie[def.key] ?? ""))
+          .find((x) => x !== null);
+        return premier ?? "Une caractéristique est invalide.";
+      }
       return null;
     }
     if (target === 1) {
+      // LES DEUX ANCIENNES ÉTAPES, DANS L'ORDRE DE L'ÉCRAN : la référence d'abord (le
+      // SKU — le poids a quitté cette étape), la mise en vente ensuite. Le premier
+      // message pointe donc toujours le champ le plus haut, comme avant la fusion.
       const value = effectiveSku.trim().toUpperCase();
       if (value.length === 0) return "Le SKU est obligatoire.";
       if (value.length > 64) return "Le SKU doit faire 64 caractères au plus.";
       if (!SKU_PATTERN.test(value))
         return "Le SKU n'accepte que lettres, chiffres, tirets et underscores — ni espace, ni accent.";
-      if (!/^\d+$/.test(weight.trim()))
-        return "Le poids doit être un nombre entier de grammes.";
-      return null;
-    }
-    if (target === 2) {
-      // Le serveur refuse la création d'offre (403) si la boutique n'est ni active ni
-      // en attente. On le sait déjà — autant le dire avant les photos, pas après.
-      const status = shop.data?.status?.toLowerCase();
-      if (status && status !== "active" && status !== "pending")
-        return "Votre boutique n'est pas en mesure de mettre un article en vente. Vérifiez son statut sur « Ma boutique ».";
+
+      // Le serveur refuse la création (403) si la boutique n'est ni active ni en
+      // attente — la fiche ET l'offre, depuis que `CreateWithImagesAsync` est gardée.
+      // Le bandeau le dit dès l'étape 0 ; ce contrôle-ci garde le cas où le statut
+      // change pendant la saisie. La règle vient de `peutVendre`, pas d'une liste
+      // recopiée qui divergerait au premier changement de politique.
+      if (shop.data && !peutVendre(shop.data.status))
+        return raisonDeRefus(shop.data.status, shop.data.suspensionReason);
       if (!/^\d+$/.test(sellerPrice.replace(/\s/g, "")) || Number(sellerPrice.replace(/\s/g, "")) <= 0)
         return "Indiquez le montant que vous percevez, en nombre entier.";
       if (!locationId) return "Choisissez un lieu d'expédition.";
@@ -265,9 +352,9 @@ export default function NewProductPage() {
     const err = validate(step);
     if (err) {
       if (step === 0) setImagesTouched(true);
-      // Le champ fautif peut vivre dans une section repliée : un toast rouge sans
-      // aucun champ en erreur à l'écran, c'est une impasse. On déplie.
-      if (step === 1 && !/^\d+$/.test(weight.trim())) setVariantOptions(true);
+      // Le dépliage forcé de la section « Attributs » n'a plus lieu d'être : le seul
+      // champ obligatoire qu'elle contenait — le poids — a quitté cet assistant. Ce
+      // qui y reste est facultatif, et ne peut donc plus faire échouer une étape.
       toastError(err);
       return;
     }
@@ -278,7 +365,8 @@ export default function NewProductPage() {
   async function submit() {
     if (submitting.current) return;
 
-    for (let s = 0; s <= 2; s++) {
+    // Les étapes SAISISSABLES : 0 et 1. La 2 est le récapitulatif, elle ne valide rien.
+    for (let s = 0; s <= 1; s++) {
       const err = validate(s);
       if (err) {
         setStep(s);
@@ -307,17 +395,19 @@ export default function NewProductPage() {
       // `description` n'est PAS optionnel côté serveur (paramètre non nullable) :
       // omettre le champ ferait échouer le binding multipart avant toute validation.
       form.append("description", description.trim());
-      if (brandId) form.append("brandId", brandId);
-      if (gtin.trim()) form.append("gtin", gtin.trim());
-      if (ean.trim()) form.append("ean", ean.trim());
+      // Marque, GTIN et mots-clés ne sont plus demandés ici : ils sont facultatifs,
+      // corrigeables depuis la fiche, et le multipart les traite comme absents quand
+      // le champ n'est pas posé — `Product.Create` reçoit donc `null` et une liste de
+      // tags vide, exactement ce qu'il recevait d'un formulaire laissé en blanc.
 
-      const tagList = tags
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean);
-      // Une seule chaîne « a,b,c » : le binding multipart d'un tableau de chaînes
-      // n'est pas fiable, et le serveur découpe lui-même sur la virgule.
-      if (tagList.length > 0) form.append("tags", tagList.join(","));
+      // Le serveur attend un objet clé/valeur sérialisé (`attributesJson`), et refuse
+      // un JSON mal formé en 400. On n'envoie le champ QUE s'il y a quelque chose
+      // dedans : une chaîne « {} » n'apporterait rien et ferait passer le formulaire
+      // pour rempli dans les journaux.
+      const attributsProduit = attributsANEnvoyer(attributsCategorie);
+      if (Object.keys(attributsProduit).length > 0) {
+        form.append("attributesJson", JSON.stringify(attributsProduit));
+      }
 
       // L'ORDRE des fichiers compte : le serveur fait de la première l'image principale.
       for (const image of images) form.append("images", imagePayload(image));
@@ -340,8 +430,11 @@ export default function NewProductPage() {
         body: JSON.stringify({
           sku: normalizedSku,
           attributes: attributeMap,
-          barcode: barcode.trim() || null,
-          weightGrams: Number(weight.trim()),
+          // Code-barres et dimensions ne sont plus demandés — personne ne les lit.
+          // Le poids part à 0, valeur que le domaine accepte (`>= 0`) et que la fiche
+          // produit permet de corriger ; aucun calcul ne s'en sert aujourd'hui.
+          barcode: null,
+          weightGrams: 0,
           lengthMm: null,
           widthMm: null,
           heightMm: null,
@@ -360,7 +453,9 @@ export default function NewProductPage() {
           condition,
           fulfillmentType: "Fbs",
           shipFromLocationId: locationId,
-          handlingTime: Number(handlingTime),
+          // Deux jours, la valeur que le champ proposait par défaut. Il se règle
+          // désormais depuis la carte « Mises en vente » de la fiche produit.
+          handlingTime: 2,
         }),
       });
       createdOfferId = offer.offerId;
@@ -387,7 +482,7 @@ export default function NewProductPage() {
       // ⚠️ ON NE RELÂCHE PAS LA GARDE ICI.
       //
       // `router.replace` est asynchrone : entre le déclenchement de la navigation et
-      // le démontage réel, l'étape 4 reste à l'écran. Relâcher `submitting` dans le
+      // le démontage réel, le récapitulatif reste à l'écran. Relâcher `submitting` dans le
       // `finally` rallumait le bouton « Créer le produit » pendant cet intervalle —
       // un second clic recréait produit et déclinaison, puis échouait en 409 sur le
       // SKU déjà pris, et affichait un ÉCHEC alors qu'un produit venait d'être créé.
@@ -475,7 +570,33 @@ export default function NewProductPage() {
         à la dernière étape : rien n&apos;est enregistré avant votre confirmation.
       </PageNote>
 
-      <QueryError of={[categories, brands, locations, shop]} />
+      <QueryError of={[categories, locations, shop]} />
+
+      {/* ═══════════════════════════════════════════════════════════════════════════
+          LE DROIT DE VENDRE, DIT À L'ÉTAPE 0 ET PLUS À L'ÉTAPE 1.
+
+          Le contrôle existait, mais dans `validate(1)` : il ne tombait qu'au clic sur
+          « Suivant », c'est-à-dire APRÈS le choix de la catégorie, la rédaction de la
+          fiche, les caractéristiques et le téléversement des photos. C'est l'écran le
+          plus exposé du lot — `CreateWithImagesAsync` ne refusait rien du tout avant
+          ce même lot, et le refuse désormais.
+
+          Le contrôle de `validate` reste en place : il garde le cas où le statut
+          change pendant la saisie.
+          ═══════════════════════════════════════════════════════════════════════════ */}
+      {shop.data && !peutVendre(shop.data.status) && (
+        <Card className="mb-4 p-4 text-sm">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <div className="space-y-1">
+              <p className="font-medium">Création indisponible</p>
+              <p className="text-muted-foreground">
+                {raisonDeRefus(shop.data.status, shop.data.suspensionReason)}
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
 
       <StepBar step={step} />
 
@@ -495,13 +616,22 @@ export default function NewProductPage() {
                     <CategoryPicker
                       categories={categories.data ?? []}
                       value={categoryId}
-                      onChange={setCategoryId}
+                      onChange={(id) => {
+                        setCategoryId(id);
+                        // Voir `attributsCategorie` : les clés d'un schéma n'ont aucun
+                        // sens dans un autre.
+                        setAttributsCategorie({});
+                      }}
                       loading={categories.isLoading}
+                      /* Le serveur refuse une catégorie qui a des sous-catégories. Les
+                         filtrer ici évite de l'apprendre après avoir rempli quatre
+                         étapes et téléversé les photos. */
+                      feuillesSeulement
                     />
                   )}
                   <p className="text-xs text-muted-foreground">
-                    Elle détermine le classement en boutique et n&apos;est plus modifiable
-                    ensuite.
+                    Elle détermine le classement en boutique, les caractéristiques qui vous
+                    seront demandées, et n&apos;est plus modifiable ensuite.
                   </p>
                 </div>
 
@@ -530,6 +660,38 @@ export default function NewProductPage() {
                   </p>
                 </div>
 
+                {/* Placé AVANT les photos, délibérément. Un attribut obligatoire non
+                    renseigné bloque l'étape ; le découvrir après avoir choisi et
+                    téléversé cinq images, c'est exactement le parcours qu'on répare.
+                    Masqué quand la catégorie n'impose rien, pour ne pas ajouter une
+                    section vide au cas le plus courant. */}
+                {schemaCategorie.length > 0 && (
+                  <div className="space-y-1.5">
+                    <Label>Caractéristiques de la catégorie</Label>
+                    <CategoryAttributesForm
+                      schema={schemaCategorie}
+                      valeurs={attributsCategorie}
+                      onChange={setAttributsCategorie}
+                      categorieChoisie={categoryId !== ""}
+                    />
+                  </div>
+                )}
+
+                {/* UN SCHÉMA VIDE AVEC `allowUnknown: false` EST UN CAS RÉEL, et il ne
+                    se voyait nulle part. `CategoryAttributeSchema` accepte zéro attribut
+                    tout en refusant les clés inconnues : `IsEmpty` est alors faux et
+                    `Validate` rejette TOUTE caractéristique. Comme il n'y a rien à
+                    dessiner, le bloc ci-dessus reste masqué — et l'assistant n'aurait
+                    rien dit du tout. Ici il n'y a encore rien à saisir, mais le vendeur
+                    saura pourquoi la fiche refusera ses ajouts plus tard. */}
+                {categoryId !== "" && schemaCategorie.length === 0 && categorieFermee && (
+                  <p className="text-xs text-amber-700 dark:text-amber-400">
+                    Cette catégorie n&apos;accepte aucune caractéristique personnalisée. Vous
+                    pourrez décrire le produit dans la description, mais pas y ajouter de
+                    couples « nom : valeur » depuis la fiche.
+                  </p>
+                )}
+
                 <div className="space-y-1.5">
                   <Label>Photos</Label>
                   <ProductImagesField
@@ -543,75 +705,26 @@ export default function NewProductPage() {
                   />
                 </div>
 
-                <Expandable
-                  title="Plus d'informations (facultatif)"
-                  open={moreInfo}
-                  onToggle={() => setMoreInfo((v) => !v)}
-                >
-                  <div className="space-y-4">
-                    <div className="space-y-1.5">
-                      <Label htmlFor="w-brand">Marque</Label>
-                      <Select
-                        id="w-brand"
-                        value={brandId}
-                        onChange={(e) => setBrandId(e.target.value)}
-                      >
-                        <option value="">Sans marque</option>
-                        {(brands.data ?? []).map((b) => (
-                          <option key={b.id} value={b.id}>
-                            {b.name}
-                          </option>
-                        ))}
-                      </Select>
-                    </div>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="space-y-1.5">
-                        <Label htmlFor="w-gtin">GTIN</Label>
-                        <Input
-                          id="w-gtin"
-                          inputMode="numeric"
-                          value={gtin}
-                          onChange={(e) => setGtin(e.target.value.replace(/\D/g, ""))}
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label htmlFor="w-ean">EAN</Label>
-                        <Input
-                          id="w-ean"
-                          inputMode="numeric"
-                          value={ean}
-                          onChange={(e) => setEan(e.target.value.replace(/\D/g, ""))}
-                        />
-                      </div>
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label htmlFor="w-tags">Mots-clés</Label>
-                      <Input
-                        id="w-tags"
-                        value={tags}
-                        onChange={(e) => setTags(e.target.value)}
-                        placeholder="cuir, sac, artisanal"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        Séparés par des virgules. Ils aident la recherche à trouver votre
-                        article.
-                      </p>
-                    </div>
-                  </div>
-                </Expandable>
+                {/* ═══════════════════════════════════════════════════════════════
+                    LE REPLI « PLUS D'INFORMATIONS » A DISPARU AVEC SON CONTENU.
+
+                    Il portait exactement quatre champs — marque, GTIN, EAN, mots-clés —
+                    et les quatre ont été retirés ou déplacés sur la fiche. Garder le
+                    dépliant vide aurait laissé croire qu'il reste quelque chose à
+                    remplir.
+                    ═══════════════════════════════════════════════════════════════ */}
               </>
             )}
 
-            {/* ══════════════ Étape 2 — Déclinaison ══════════════ */}
+            {/* ══════════════ Étape 2 — Référence, vente et stock ══════════════ */}
             {step === 1 && (
               <>
                 <p className="flex items-start gap-2 rounded-xl bg-muted/60 p-3 text-xs text-muted-foreground">
                   <Info className="mt-0.5 size-4 shrink-0" />
-                  Une déclinaison, c&apos;est une version précise de l&apos;article (une
-                  taille, une couleur). Son <strong>SKU</strong> est la référence que vous
-                  retrouverez en stock, sur vos offres et sur vos commandes. Un article
-                  simple n&apos;en a qu&apos;une — vous pourrez en ajouter d&apos;autres plus
-                  tard depuis la fiche.
+                  Le <strong>SKU</strong> est la référence que vous retrouverez en stock, sur
+                  vos offres et sur vos commandes. Un article simple n&apos;en a qu&apos;une —
+                  vous pourrez ajouter d&apos;autres déclinaisons (taille, couleur) plus tard
+                  depuis la fiche.
                 </p>
 
                 <div className="space-y-1.5">
@@ -637,8 +750,11 @@ export default function NewProductPage() {
                   </p>
                 </div>
 
+                {/* Le titre ne parle plus de « logistique » : le code-barres et le poids
+                    l'ont quitté. Ne reste que ce qu'un ACHETEUR lit — les attributs
+                    pilotent son sélecteur de taille ou de couleur. */}
                 <Expandable
-                  title="Attributs et logistique (facultatif)"
+                  title="Attributs de la déclinaison (facultatif)"
                   open={variantOptions}
                   onToggle={() => setVariantOptions((v) => !v)}
                 >
@@ -702,38 +818,16 @@ export default function NewProductPage() {
                       </Button>
                     </div>
 
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="space-y-1.5">
-                        <Label htmlFor="w-barcode">Code-barres</Label>
-                        <Input
-                          id="w-barcode"
-                          value={barcode}
-                          onChange={(e) => setBarcode(e.target.value)}
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label htmlFor="w-weight">Poids (g)</Label>
-                        <Input
-                          id="w-weight"
-                          inputMode="numeric"
-                          value={weight}
-                          onChange={(e) => setWeight(e.target.value)}
-                        />
-                        {!/^\d+$/.test(weight.trim()) && (
-                          <p className="text-xs text-destructive">
-                            Un nombre entier de grammes est attendu.
-                          </p>
-                        )}
-                      </div>
-                    </div>
                   </div>
                 </Expandable>
-              </>
-            )}
 
-            {/* ══════════════ Étape 3 — Vente et stock ══════════════ */}
-            {step === 2 && (
-              <>
+                {/* Césure entre les deux moitiés de l'étape fusionnée : la référence
+                    au-dessus, la mise en vente en dessous. Sans elle, huit champs se
+                    suivent sans qu'on voie qu'ils parlent de deux choses. */}
+                <div className="border-t border-border pt-4 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Mise en vente et stock initial
+                </div>
+
                 <div className="space-y-1.5">
                   <Label htmlFor="w-condition">État de l&apos;article</Label>
                   <Select
@@ -745,6 +839,25 @@ export default function NewProductPage() {
                     <option value="Used">Occasion</option>
                     <option value="Refurbished">Reconditionné</option>
                   </Select>
+                  {/* ═══════════════════════════════════════════════════════════════
+                      DIT AU MOMENT DU CHOIX, PLUS SEULEMENT AU RÉCAPITULATIF.
+
+                      `Offer.Condition` n'est affecté qu'au constructeur, et aucune des
+                      méthodes du domaine ne le change (`ChangePrice`, `ApplyDiscount`,
+                      `RemoveDiscount`, `SetHandlingTime`, `ChangeShipFromLocation`,
+                      `Activate`, `Pause`, `MarkOutOfStock`). Aucune route non plus :
+                      `SellerOfferEndpoints` ne monte que `price`, `status`,
+                      `handling-time`, `discount` et `DELETE`.
+
+                      La catégorie, elle, annonçait déjà son caractère définitif à
+                      l'endroit du choix. Ces deux-là ne le faisaient nulle part : le
+                      vendeur l'apprenait au récapitulatif, une étape plus loin, ou pas
+                      du tout.
+                      ═══════════════════════════════════════════════════════════════ */}
+                  <p className="text-xs text-muted-foreground">
+                    Ce choix n&apos;est <strong>plus modifiable ensuite</strong> : le corriger
+                    demande de supprimer la mise en vente et de la recréer.
+                  </p>
                 </div>
 
                 <div className="space-y-1.5">
@@ -775,9 +888,16 @@ export default function NewProductPage() {
                       Lieux indisponibles — rechargez la page avant de continuer.
                     </p>
                   ) : locationList.length === 0 && !locations.isLoading ? (
+                    /* L'ENTREPÔT N'ESTIME AUCUN DÉLAI. Le délai annoncé à l'acheteur vient de la zone
+                       de DESTINATION : `GetRatesForCommuneAsync(communeCode)` résout la commune de
+                       l'acheteur, puis rend le `ShippingRate.Eta` de cette zone.
+
+                       `ShipFromLocationId` n'est lu par le module Shipping que pour deux choses, dont
+                       aucune n'est un délai : grouper les expéditions par (vendeur, entrepôt), et
+                       donner au coursier l'adresse où il vient chercher le colis. */
                     <div className="rounded-xl bg-amber-100 p-3 text-xs text-amber-800 dark:bg-amber-500/15 dark:text-amber-400">
-                      Aucun entrepôt enregistré. C&apos;est le point de départ utilisé pour
-                      estimer les délais de livraison.
+                      Aucun entrepôt enregistré. C&apos;est l&apos;adresse où le coursier vient
+                      chercher vos colis.
                       <div className="mt-2">
                         <Button
                           type="button"
@@ -817,6 +937,29 @@ export default function NewProductPage() {
                       </Button>
                     </>
                   )}
+                  {/* ═══════════════════════════════════════════════════════════════
+                      MÊME SILENCE QUE POUR L'ÉTAT, AVEC UNE CONSÉQUENCE DE PLUS.
+
+                      `Offer.ShipFromLocationId` a bien une méthode de domaine
+                      (`ChangeShipFromLocation`) — mais elle n'a AUCUN appelant : ni
+                      commande, ni handler, ni route, ni test. Elle est prête à être
+                      branchée, elle ne l'est pas.
+
+                      Et le remède ne se limite pas à refaire l'offre. Le stock est
+                      indexé par (SKU, lieu) — index UNIQUE — et la réservation se fait
+                      sur le lieu PORTÉ PAR L'OFFRE : `TryReserveAsync(line.Sku,
+                      line.ShipFromLocationId, …)`. Une offre recréée sur un entrepôt
+                      sans stock reste en vitrine et fait échouer chaque commande en
+                      `ordering.out_of_stock`, pendant que la page Stock affiche les
+                      unités en rayon. C'est ce piège-là qu'il faut nommer, pas seulement
+                      l'impossibilité de modifier.
+                      ═══════════════════════════════════════════════════════════════ */}
+                  <p className="text-xs text-muted-foreground">
+                    C&apos;est d&apos;ici que partiront vos colis, et le stock y est rattaché.
+                    Ce choix n&apos;est <strong>plus modifiable ensuite</strong> : en changer
+                    demande de refaire la mise en vente, puis de suivre la référence au
+                    nouvel entrepôt et de ramener l&apos;ancien à zéro.
+                  </p>
                 </div>
 
                 <div className="grid gap-4 sm:grid-cols-2">
@@ -837,39 +980,75 @@ export default function NewProductPage() {
                       value={threshold}
                       onChange={(e) => setThreshold(e.target.value)}
                     />
+                    {/* `InventoryItem.IsLowStock => Available <= ReorderThreshold` : le
+                        seuil est INCLUS. « En dessous » se trompait d'un cran — à seuil 5
+                        et stock 5, la référence est déjà signalée. */}
                     <p className="text-xs text-muted-foreground">
-                      En dessous, la référence est signalée en stock faible.
+                      À ce niveau ou en dessous, la référence est signalée en stock faible.
                     </p>
                   </div>
                 </div>
 
-                <div className="space-y-1.5">
-                  <Label htmlFor="w-handling">Délai de préparation</Label>
-                  <Select
-                    id="w-handling"
-                    value={handlingTime}
-                    onChange={(e) => setHandlingTime(e.target.value)}
-                  >
-                    {HANDLING_TIMES.map((d) => (
-                      <option key={d} value={String(d)}>
-                        {d} jour{d > 1 ? "s" : ""}
-                      </option>
-                    ))}
-                  </Select>
-                  <p className="text-xs text-muted-foreground">
-                    Entre la commande et la remise du colis au transporteur. C&apos;est ce
-                    délai qui sert à annoncer une date de livraison.
-                  </p>
-                </div>
+                {/* ═══════════════════════════════════════════════════════════════
+                    LE DÉLAI DE PRÉPARATION A QUITTÉ L'ASSISTANT.
+
+                    Aucun calcul ne s'en sert — ni date promise, ni SLA, ni alerte de
+                    retard : ces notions n'existent nulle part dans le dépôt. Le délai
+                    que l'acheteur LIT vient de `ShippingRate.Eta`, attaché au mode de
+                    livraison qu'il choisit, et l'entrepôt de départ n'y entre pas.
+
+                    Il reste utile au vendeur, qui le retrouve sur la carte « Mises en
+                    vente » de la fiche produit (« Préparation : N jour(s) ») et l'y règle
+                    en un clic. Le demander AVANT la première mise en vente, pour une
+                    valeur qui ne sort de la console qu'en repère personnel, coûtait un
+                    champ à tout le monde pour n'en servir aucun.
+
+                    La création part sur deux jours — ce que le champ proposait déjà par
+                    défaut, donc la valeur que la quasi-totalité des offres portait.
+                    ═══════════════════════════════════════════════════════════════ */}
               </>
             )}
 
-            {/* ══════════════ Étape 4 — Récapitulatif ══════════════ */}
-            {step === 3 && (
+            {/* ══════════════ Étape 3 — Récapitulatif ══════════════ */}
+            {step === 2 && (
               <>
+                {/* ═══════════════════════════════════════════════════════════════
+                    « TOUT RESTE MODIFIABLE ENSUITE » — TROIS CHAMPS SUR CET ÉCRAN
+                    DÉMENTAIENT CETTE PHRASE, ET C'EST LA DERNIÈRE QUE LE VENDEUR LIT
+                    AVANT DE VALIDER.
+
+                      - CATÉGORIE : définitive. `Product.CategoryId` n'est affecté que
+                        dans le constructeur, et `UpdateProductCommand` ne le porte pas.
+                        Aucune route, aucune méthode de domaine ne la change.
+                      - ÉTAT DE L'ARTICLE et LIEU D'EXPÉDITION : `SellerOfferEndpoints` ne
+                        monte que `price`, `status`, `handling-time`, `discount` et
+                        `DELETE`. Ni l'un ni l'autre n'a de route de modification.
+
+                    Les deux derniers ont un remède : supprimer la mise en vente et la
+                    recréer. La fiche produit, elle, survit — `DeleteOfferCommandHandler`
+                    ne touche ni au produit, ni aux médias, ni au stock.
+
+                    MAIS CE REMÈDE EST INCOMPLET POUR LE LIEU, ET LA PREMIÈRE RÉDACTION LE
+                    DONNAIT COMME SUFFISANT. Le stock est indexé par (SKU, lieu) — index
+                    UNIQUE, `InventoryItemConfiguration` — et la réservation se fait sur le
+                    lieu PORTÉ PAR L'OFFRE : `TryReserveAsync(line.Sku,
+                    line.ShipFromLocationId, …)`. Recréer l'offre au nouvel entrepôt sans y
+                    déplacer le stock donne une offre en vitrine dont chaque commande
+                    échoue en `ordering.out_of_stock` — « stock insuffisant » — pendant que
+                    la page Stock affiche les unités en rayon. Un recours à moitié donné
+                    est pire qu'un recours tu : il est suivi.
+
+                    L'écran ne prévient QU'ICI, à la dernière étape, alors que les choix ont
+                    été faits à l'étape précédente. C'est mieux que rien ; le signaler au
+                    moment du choix est le point suivant de l'ordre de réparation.
+                    ═══════════════════════════════════════════════════════════════ */}
                 <p className="text-sm text-muted-foreground">
-                  Vérifiez avant de créer. Tout reste modifiable ensuite depuis la fiche du
-                  produit.
+                  Vérifiez avant de créer. Presque tout reste modifiable ensuite depuis la fiche
+                  — sauf trois choix. La <strong>catégorie</strong> est définitive.
+                  L&apos;<strong>état de l&apos;article</strong> demande de supprimer la mise en
+                  vente et de la recréer. Le <strong>lieu d&apos;expédition</strong> aussi, et il
+                  faut en plus y déplacer votre stock : une offre qui expédie depuis un entrepôt
+                  sans stock fait échouer chaque commande.
                 </p>
 
                 <SummaryCard
@@ -883,10 +1062,6 @@ export default function NewProductPage() {
                         const c = all.find((x) => x.id === categoryId);
                         return c ? categoryReadablePath(c, all) : "—";
                       })(),
-                    ],
-                    [
-                      "Marque",
-                      (brands.data ?? []).find((b) => b.id === brandId)?.name ?? "Sans marque",
                     ],
                     ["Photos", `${images.length}`],
                   ]}
@@ -917,7 +1092,6 @@ export default function NewProductPage() {
                         .map((a) => `${a.key.trim()} : ${a.value.trim()}`)
                         .join(" · ") || "—",
                     ],
-                    ["Poids", `${weight.trim() || 0} g`],
                   ]}
                 />
 
@@ -942,7 +1116,11 @@ export default function NewProductPage() {
                       })(),
                     ],
                     ["Stock initial", onHand.trim()],
-                    ["Délai de préparation", `${handlingTime} jour(s)`],
+                    /* ANNONCÉ PARCE QU'ÉCRIT. Le délai n'est plus demandé, mais l'offre
+                       naît quand même avec une valeur — et l'écran dit « vérifiez avant
+                       de créer ». Taire un champ qu'on écrit, c'est demander une
+                       vérification impossible. */
+                    ["Délai de préparation", "2 jours — modifiable depuis la fiche"],
                   ]}
                 />
 
@@ -1172,11 +1350,18 @@ function NewLocationDialog({
   }
 
   return (
+    /* L'ENTREPÔT N'ESTIME AUCUN DÉLAI. Le délai annoncé à l'acheteur vient de la zone
+       de DESTINATION : `GetRatesForCommuneAsync(communeCode)` résout la commune de
+       l'acheteur, puis rend le `ShippingRate.Eta` de cette zone.
+
+       `ShipFromLocationId` n'est lu par le module Shipping que pour deux choses, dont
+       aucune n'est un délai : grouper les expéditions par (vendeur, entrepôt), et
+       donner au coursier l'adresse où il vient chercher le colis. */
     <Dialog
       open={open}
       onClose={onClose}
       title="Nouvel entrepôt"
-      description="C'est le point de départ de vos colis : il sert à estimer les délais de livraison annoncés à l'acheteur."
+      description="C'est l'adresse où le coursier vient chercher vos colis. Le délai annoncé à l'acheteur, lui, dépend de sa commune de livraison."
       footer={
         <>
           <Button variant="outline" onClick={onClose}>

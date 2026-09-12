@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
+import { useDroitDeVendre } from "@/lib/selling";
 import { formatDateTime, shortId } from "@/lib/utils";
 import { statusLabel } from "@/lib/status-labels";
 import { Badge } from "@/components/ui/badge";
@@ -13,7 +14,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
 import type { SellerProduct, SellerReview } from "@/types/seller";
-import { BadgeCheck, Flag, Loader2, MessageSquareReply, Star } from "lucide-react";
+import { AlertTriangle, BadgeCheck, Flag, Loader2, MessageSquareReply, Star } from "lucide-react";
 
 const TABS = [
   { key: "todo", label: "Sans réponse" },
@@ -45,6 +46,7 @@ function reviewTone(status: string): "success" | "warning" | "danger" | "neutral
 
 export default function ReviewsPage() {
   const qc = useQueryClient();
+  const droit = useDroitDeVendre();
   const [tab, setTab] = useState<TabKey>("todo");
   const [replyId, setReplyId] = useState<string | null>(null);
   const [flagId, setFlagId] = useState<string | null>(null);
@@ -127,6 +129,30 @@ export default function ReviewsPage() {
 
       <QueryError of={[q, products]} />
 
+      {/* ═══════════════════════════════════════════════════════════════════════════
+          LE DROIT D'ÉCRIRE, DIT UNE FOIS EN HAUT PLUTÔT QU'À CHAQUE BOUTON.
+
+          Une SEULE écriture de cet écran est gardée par `SellerRights.CanSell` :
+          `ReplyAsync`. Le signalement passe par `ResolveSellerAsync` et reste ouvert.
+          Le bandeau le dit, sinon il retirerait en paroles un recours que le vendeur
+          garde — et c'est précisément quand sa boutique est suspendue qu'il a des
+          raisons de signaler un avis.
+          ═══════════════════════════════════════════════════════════════════════════ */}
+      {droit.bloque && (
+        <Card className="mb-4 p-4 text-sm">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <div className="space-y-1">
+              <p className="font-medium">Réponses publiques indisponibles</p>
+              <p className="text-muted-foreground">{droit.raison}</p>
+              <p className="text-muted-foreground">
+                Le <strong>signalement</strong> d&apos;un avis, lui, reste possible.
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
       <div className="mb-4 flex flex-wrap gap-2">
         {TABS.map((t) => (
           <Button
@@ -184,38 +210,100 @@ export default function ReviewsPage() {
                 {r.title && <div className="font-medium">{r.title}</div>}
                 {r.body && <p className="mt-1 whitespace-pre-wrap text-sm">{r.body}</p>}
 
+                {/* ═══════════════════════════════════════════════════════════════
+                    LA RÉPONSE N'ÉTAIT DÉFINITIVE QUE PARCE QUE CET ÉCRAN LE DÉCIDAIT.
+
+                    Dès que `sellerReply` existait, le bloc passait en lecture seule et
+                    le bouton disparaissait. Or `Review.Reply` est documentée « remplace
+                    une réponse existante », et le serveur accepte le remplacement depuis
+                    toujours : rien dans le domaine ne distingue la première réponse
+                    d'une correction.
+
+                    UNE SEULE GARDE, ET ELLE VAUT POUR LES DEUX : la route passe par
+                    `ResolveSellingSellerAsync`, donc `SellerRights.CanSell` — une
+                    boutique suspendue, fermée ou en attente de réactivation est refusée
+                    en 403, qu'elle réponde ou qu'elle corrige. C'est le constat M4 de
+                    l'audit, et les deux commandes sont désormais neutralisées AVANT la
+                    rédaction, motif affiché en tête d'écran.
+                    Une faute de frappe dans une réponse PUBLIQUE était donc définitive
+                    par accident d'interface — et le panneau de saisie l'affirmait au
+                    vendeur, ce qui l'empêchait même de chercher.
+                    ═══════════════════════════════════════════════════════════════ */}
                 {r.sellerReply ? (
                   <div className="mt-3 rounded-xl bg-primary/5 p-3">
                     <div className="mb-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
                       <span className="font-medium">Votre réponse</span>
-                      {r.sellerRepliedAtUtc && <span>{formatDateTime(r.sellerRepliedAtUtc)}</span>}
+                      <span className="flex items-center gap-2">
+                        {r.sellerRepliedAtUtc && <span>{formatDateTime(r.sellerRepliedAtUtc)}</span>}
+                        {/* DÉSACTIVÉ, PAS MASQUÉ. Escamoter le lien laissait le vendeur
+                            qui s'en servait la veille chercher ce qui avait disparu, sans
+                            rien à quoi rattacher l'explication. Un élément grisé, lui,
+                            renvoie au bandeau de tête. */}
+                        <button
+                          type="button"
+                          onClick={() => setReplyId(r.id)}
+                          disabled={droit.bloque}
+                          className="text-primary hover:underline disabled:cursor-default disabled:text-muted-foreground disabled:no-underline"
+                        >
+                          Modifier
+                        </button>
+                      </span>
                     </div>
                     <p className="whitespace-pre-wrap text-sm">{r.sellerReply}</p>
                   </div>
                 ) : (
                   <div className="mt-3">
-                    <Button size="sm" onClick={() => setReplyId(r.id)}>
+                    {/* `ReplyAsync` est la SEULE écriture de cet écran gardée par
+                        `CanSell` — le signalement, lui, passe par `ResolveSellerAsync`
+                        et reste ouvert. On ne neutralise donc que la réponse. */}
+                    <Button size="sm" onClick={() => setReplyId(r.id)} disabled={droit.bloque}>
                       <MessageSquareReply className="size-4" /> Répondre
                     </Button>
                   </div>
                 )}
 
-                {/* SIGNALEMENT : proposé indépendamment de la réponse — le vendeur peut
-                    vouloir les deux — mais JAMAIS sur un avis déjà signalé. Le domaine
-                    accepte un second `Flag()`, qui ne fait rien de plus et re-toaste
-                    « signalé à la modération » : l'écran laisse donc croire à une
-                    nouvelle action là où il n'y en a aucune. */}
-                {r.status?.toLowerCase() !== "flagged" ? (
-                  <div className="mt-3">
-                    <Button size="sm" variant="outline" onClick={() => setFlagId(r.id)}>
-                      <Flag className="size-4" /> Signaler
-                    </Button>
-                  </div>
-                ) : (
-                  <p className="mt-3 text-xs text-muted-foreground">
-                    Signalé — en attente de l&apos;examen de la modération.
-                  </p>
-                )}
+                {/* ═══════════════════════════════════════════════════════════════
+                    SIGNALEMENT : proposé indépendamment de la réponse — le vendeur peut
+                    vouloir les deux — mais ni sur un avis DÉJÀ SIGNALÉ, ni sur un avis
+                    REJETÉ.
+
+                    Déjà signalé : le domaine accepte un second `Flag()`, qui ne fait
+                    rien de plus et re-toaste « signalé à la modération » ; l'écran
+                    laissait croire à une nouvelle action là où il n'y en a aucune.
+
+                    REJETÉ : `Review.Flag()` refuse en 409 (« Un avis rejeté ne peut pas
+                    être signalé »). Et ces avis-là arrivent bien jusqu'ici — le dépôt
+                    vendeur ne filtre pas sur le statut, contrairement à la lecture
+                    publique. Le vendeur cliquait, lisait un dialogue, confirmait, et
+                    récoltait une erreur ; à chaque tentative, sur un avis que la
+                    modération avait DÉJÀ retiré à sa demande. Le signalement avait
+                    abouti, et l'écran le lui présentait comme un geste encore à faire.
+                    ═══════════════════════════════════════════════════════════════ */}
+                {(() => {
+                  const etat = r.status?.toLowerCase();
+                  if (etat === "rejected") {
+                    return (
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        Retiré par la modération — cet avis n&apos;est plus visible par les
+                        acheteurs et ne compte plus dans votre note.
+                      </p>
+                    );
+                  }
+                  if (etat === "flagged") {
+                    return (
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        Signalé — en attente de l&apos;examen de la modération.
+                      </p>
+                    );
+                  }
+                  return (
+                    <div className="mt-3">
+                      <Button size="sm" variant="outline" onClick={() => setFlagId(r.id)}>
+                        <Flag className="size-4" /> Signaler
+                      </Button>
+                    </div>
+                  );
+                })()}
               </CardContent>
             </Card>
           ))}
@@ -239,6 +327,19 @@ function ReplyDialog({
 }) {
   const [body, setBody] = useState("");
 
+  // La réponse existante est PRÉREMPLIE : `Reply` remplace, il ne complète pas.
+  // Ouvrir sur un champ vide ferait écrire une réponse de zéro à qui voulait corriger
+  // un mot — et effacerait l'ancienne sans que personne l'ait décidé.
+  const dejaRepondu = Boolean(item?.sellerReply);
+  useEffect(() => {
+    setBody(item?.sellerReply ?? "");
+  }, [item?.id, item?.sellerReply]);
+
+  // Un avis rejeté n'est pas servi aux lectures publiques : la réponse serait écrite
+  // pour personne. On ne l'interdit pas — la modération peut republier — mais on le dit.
+  const avisNonPublic =
+    item !== null && !["published", "flagged"].includes((item.status ?? "").toLowerCase());
+
   const send = useMutation({
     mutationFn: () =>
       bff(`/seller/reviews/${item?.id}/reply`, { method: "POST", body: JSON.stringify({ body: body.trim() }) }),
@@ -248,8 +349,8 @@ function ReplyDialog({
       onClose();
     },
     meta: {
-      successMessage: "Réponse publiée.",
-      errorMessage: "La réponse n'a pas pu être publiée.",
+      successMessage: "Réponse enregistrée.",
+      errorMessage: "La réponse n'a pas pu être enregistrée.",
     },
   });
 
@@ -263,7 +364,7 @@ function ReplyDialog({
     <Dialog
       open={item !== null}
       onClose={close}
-      title="Répondre à cet avis"
+      title={dejaRepondu ? "Modifier votre réponse" : "Répondre à cet avis"}
       footer={
         <>
           <Button variant="ghost" onClick={close} disabled={send.isPending}>
@@ -271,7 +372,7 @@ function ReplyDialog({
           </Button>
           <Button onClick={() => send.mutate()} disabled={send.isPending || body.trim().length === 0}>
             {send.isPending && <Loader2 className="size-4 animate-spin" />}
-            Publier la réponse
+            {dejaRepondu ? "Remplacer la réponse" : "Publier la réponse"}
           </Button>
         </>
       }
@@ -290,10 +391,20 @@ function ReplyDialog({
             rows={4}
             autoFocus
           />
+          {/* « l'API ne permet pas de la modifier » était faux : `Review.Reply`
+              remplace une réponse existante, sans garde côté route. */}
           <p className="rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
-            Cette réponse est <strong>publique et définitive</strong> : elle apparaîtra sous
-            l&apos;avis pour tous les acheteurs, et l&apos;API ne permet pas de la modifier ensuite.
+            Cette réponse est <strong>publique</strong> : elle apparaît sous l&apos;avis pour tous
+            les acheteurs. Vous pourrez la corriger ensuite — la nouvelle version remplace
+            l&apos;ancienne, qui n&apos;est pas conservée.
           </p>
+          {avisNonPublic && (
+            <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-200">
+              Cet avis est {statusLabel(item.status, "reviewStatus").toLowerCase()} : il est exclu
+              des lectures publiques. Votre réponse sera enregistrée, mais personne ne la verra tant
+              que la modération ne l&apos;a pas republié.
+            </p>
+          )}
         </div>
       )}
     </Dialog>

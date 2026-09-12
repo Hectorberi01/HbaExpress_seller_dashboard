@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
+import { toastError, toastSuccess } from "@/lib/toast";
+import { peutVendre, raisonDeRefus } from "@/lib/selling";
+import { ReadOnlyNote } from "@/components/read-only-note";
 import { CommuneSelect } from "@/components/commune-select";
 import { formatDateTime, maskAccount } from "@/lib/utils";
 import { accountTone, kybTone, statusLabel } from "@/lib/status-labels";
@@ -18,19 +21,24 @@ import { Textarea } from "@/components/ui/textarea";
 import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
 import type { KybDocument, SellerShop } from "@/types/seller";
+import { PAYOUT_PROVIDERS, isPayableProvider } from "@/lib/payout";
 import { AlertTriangle, Download, ImageOff, Loader2, Star, Trash2, Upload } from "lucide-react";
 
 /** Types de pièce acceptés par le domaine (`KybDocumentType`). */
 const KYB_TYPES = ["IdCard", "BusinessRegistry", "TaxId", "ProofOfAddress"] as const;
 
 /**
- * Canaux de reversement acceptés (`PayoutProvider`).
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * LA LISTE DES OPÉRATEURS VIENT DE `@/lib/payout`, ET ELLE A RÉTRÉCI.
  *
- * Liste FERMÉE : le serveur fait `Enum.TryParse` et rejette tout le reste. Un champ
- * libre laissait le vendeur saisir « MTN MoMo » — avec une espace — et recevoir un 400
- * sur l'écran qui décide où part son argent.
+ * Elle proposait cinq entrées — `Wave` et `BankAccount` comprises. Le serveur les
+ * accepte à l'ENREGISTREMENT (`Enum.TryParse` sur `PayoutProvider`) et les refuse au
+ * RETRAIT (`WalletPayout.IsMobileMoney` ne connaît que `mtnmomo`, `moovmoney`,
+ * `celtis`). Un vendeur pouvait donc enregistrer un compte parfaitement valide à
+ * l'écran, dont aucun versement ne partirait jamais — et l'apprendre des semaines plus
+ * tard, sans qu'aucun message ne relie l'échec à ce choix.
+ * ═══════════════════════════════════════════════════════════════════════════════════
  */
-const PAYOUT_PROVIDERS = ["MtnMomo", "MoovMoney", "Wave", "BankAccount", "Celtis"] as const;
 
 export default function ShopPage() {
   const qc = useQueryClient();
@@ -89,6 +97,18 @@ export default function ShopPage() {
 
 /** Bandeau d'identité : logo, statuts, note, commission. */
 function ShopHeader({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promise<unknown> }) {
+  // ═════════════════════════════════════════════════════════════════════════════════
+  // LE LOGO EST UNE ÉCRITURE GARDÉE, ET C'EST L'ÉCRAN QUI AFFICHE LE STATUT.
+  //
+  // `POST /seller/shop/logo` passe par `ResolveSellingSellerAsync`. Cet écran montrait
+  // la pastille « Suspendue » à trois centimètres d'un bouton qui allait prendre un
+  // 403 — le statut était sous les yeux du vendeur, et la console ne s'en servait pas.
+  //
+  // On le lit sur `shop`, déjà chargé : pas de requête supplémentaire, et pas d'écart
+  // possible entre la pastille affichée et le bouton neutralisé.
+  // ═════════════════════════════════════════════════════════════════════════════════
+  const ecritureBloquee = !peutVendre(shop.status);
+
   const fileRef = useRef<HTMLInputElement>(null);
 
   const upload = useMutation({
@@ -136,11 +156,20 @@ function ShopHeader({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
             variant="outline"
             className="mt-2 w-full"
             onClick={() => fileRef.current?.click()}
-            disabled={upload.isPending}
+            disabled={ecritureBloquee || upload.isPending}
           >
             {upload.isPending ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
             Logo
           </Button>
+          {/* Un bouton grisé sans motif visible envoie chercher la cause partout sauf
+              où elle est, et `disabled:pointer-events-none` interdit l'infobulle. Le
+              motif complet est dans la carte « Profil public » juste en dessous ; ici,
+              une ligne suffit à faire le lien. */}
+          {ecritureBloquee && (
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              Indisponible dans l&apos;état actuel de votre boutique — voir « Profil public ».
+            </p>
+          )}
         </div>
 
         <div className="min-w-0 flex-1">
@@ -183,6 +212,11 @@ function ShopHeader({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
 
 /** Nom, description — la partie visible par les acheteurs. */
 function ProfileCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promise<unknown> }) {
+  // `PUT /seller/shop/profile` passe par `ResolveSellingSellerAsync`. Même lecture que
+  // pour le logo, même source : le `shop` déjà chargé.
+  const ecritureBloquee = !peutVendre(shop.status);
+  const motifRefus = ecritureBloquee ? raisonDeRefus(shop.status, shop.suspensionReason) : null;
+
   const [name, setName] = useState(shop.shopName);
   const [description, setDescription] = useState(shop.description ?? "");
 
@@ -217,6 +251,9 @@ function ProfileCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => P
         <CardTitle className="text-base">Profil public</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3 p-5 pt-0">
+        {/* Le motif EN CLAIR, ici : contrairement aux autres écrans, cette page n'a pas
+            de bandeau de tête où aller le lire. */}
+        {motifRefus && <ReadOnlyNote>{motifRefus}</ReadOnlyNote>}
         <div className="space-y-1.5">
           <Label htmlFor="shopName">Nom de la boutique</Label>
           <Input id="shopName" value={name} onChange={(e) => setName(e.target.value)} />
@@ -232,7 +269,10 @@ function ProfileCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => P
           />
         </div>
         <div className="flex justify-end">
-          <Button onClick={() => save.mutate()} disabled={save.isPending || !dirty || !name.trim()}>
+          <Button
+            onClick={() => save.mutate()}
+            disabled={ecritureBloquee || save.isPending || !dirty || !name.trim()}
+          >
             {save.isPending && <Loader2 className="size-4 animate-spin" />}
             Enregistrer
           </Button>
@@ -371,6 +411,19 @@ function CompanyCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => P
 
 /** Compte de versement — c'est là que part l'argent. */
 function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promise<unknown> }) {
+  // ═════════════════════════════════════════════════════════════════════════════════
+  // ICI, C'EST `CanWithdraw` QUI DÉCIDE, PAS `CanSell`.
+  //
+  // `SetPayoutAccountAsync` passe par `ResolvePayableSellerAsync` : une boutique
+  // FERMÉE ou en attente de réactivation garde la main sur son compte de reversement —
+  // l'argent gagné avant la fermeture lui appartient. Seule la SUSPENSION bloque, le
+  // temps de l'instruction.
+  //
+  // Appliquer `peutVendre` ici aurait donc été un sur-blocage : on aurait empêché un
+  // vendeur fermé de corriger le numéro sur lequel on doit le payer.
+  // ═════════════════════════════════════════════════════════════════════════════════
+  const versementSuspendu = (shop.status ?? "").toLowerCase() === "suspended";
+
   const [open, setOpen] = useState(false);
   const [provider, setProvider] = useState(shop.payout?.provider ?? "");
   const [accountNumber, setAccountNumber] = useState("");
@@ -388,7 +441,10 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
         method: "PUT",
         body: JSON.stringify({
           provider: provider.trim(),
-          accountNumber: accountNumber.trim(),
+          // Champ laissé vide sur le même opérateur = « je ne change que le titulaire ».
+          accountNumber: numeroConserve
+            ? (shop.payout?.accountNumber ?? "")
+            : accountNumber.trim(),
           accountName: accountName.trim(),
         }),
       }),
@@ -403,7 +459,36 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
     },
   });
 
-  const valid = provider.trim() && accountNumber.trim() && accountName.trim();
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * RETAPER LE NUMÉRO N'A DE SENS QUE SI LE COMPTE CHANGE.
+   *
+   * Les trois champs étaient exigés, y compris pour corriger une faute dans le nom du
+   * titulaire : le vendeur devait retrouver et ressaisir son numéro complet pour une
+   * modification qui ne le concerne pas.
+   *
+   * LA JUSTIFICATION D'ORIGINE RESTE BONNE, ET ON LA GARDE : retaper un numéro de
+   * versement est la dernière occasion de s'apercevoir qu'on s'est trompé de compte,
+   * et un versement mal adressé n'est pas récupérable. Mais elle ne vaut que quand le
+   * compte change. Si l'opérateur est le même et que le champ reste vide, il n'y a
+   * rien à vérifier — on renvoie le numéro déjà enregistré.
+   *
+   * LE SERVEUR ÉCRASE LES TROIS CHAMPS (`SetPayoutAccountCommand`), il n'existe pas de
+   * mise à jour partielle : c'est donc bien à la console de renvoyer l'existant.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const memeOperateur = !!shop.payout && provider.trim() === shop.payout.provider;
+  // On exige aussi qu'il Y AIT un numéro à conserver. `PayoutAccount.Create` interdit
+  // d'en écrire un vide, donc le cas n'est pas atteignable aujourd'hui — mais sans ce
+  // test, la règle reposerait sur cette garantie distante plutôt que sur elle-même, et
+  // un champ vide partirait au serveur pour revenir en 400.
+  const numeroConserve =
+    memeOperateur &&
+    accountNumber.trim().length === 0 &&
+    (shop.payout?.accountNumber ?? "").trim().length > 0;
+
+  const valid =
+    provider.trim() && accountName.trim() && (accountNumber.trim() || numeroConserve);
 
   return (
     <>
@@ -416,6 +501,22 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
         </CardHeader>
         <CardContent className="p-5 pt-0">
           {shop.payout ? (
+            <>
+            {/* UN COMPTE ENREGISTRÉ N'EST PAS FORCÉMENT UN COMPTE PAYABLE.
+                Le serveur accepte Wave et le compte bancaire ici, et les refuse au
+                retrait. Sans cette ligne, la carte affiche un compte d'apparence
+                parfaite et l'échec ne se découvre qu'au premier retrait — au moment où
+                le vendeur a besoin de son argent, pas avant. */}
+            {!isPayableProvider(shop.payout.provider) && (
+              <div className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <p>
+                  <strong>Ce compte ne peut pas recevoir de versement.</strong> Seuls MTN MoMo,
+                  Moov Money et Celtiis Cash sont reversés aujourd&apos;hui. Vos demandes de
+                  retrait seront refusées tant que ce compte n&apos;est pas remplacé.
+                </p>
+              </div>
+            )}
             <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
               <div>
                 <dt className="text-xs uppercase tracking-wide text-muted-foreground">Opérateur</dt>
@@ -432,6 +533,7 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
                 <dd className="mt-0.5">{shop.payout.accountName}</dd>
               </div>
             </dl>
+            </>
           ) : (
             <div className="flex items-start gap-2.5 text-sm">
               <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
@@ -465,7 +567,10 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
             >
               Annuler
             </Button>
-            <Button onClick={() => save.mutate()} disabled={save.isPending || !valid}>
+            <Button
+              onClick={() => save.mutate()}
+              disabled={versementSuspendu || save.isPending || !valid}
+            >
               {save.isPending && <Loader2 className="size-4 animate-spin" />}
               Enregistrer
             </Button>
@@ -473,6 +578,13 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
         }
       >
         <div className="space-y-3">
+          {versementSuspendu && (
+            <ReadOnlyNote>
+              Votre boutique est suspendue : son compte de reversement ne peut pas être modifié
+              tant que la mesure court. Les sommes déjà gagnées ne sont pas perdues, elles
+              attendent la décision.
+            </ReadOnlyNote>
+          )}
           <div className="space-y-1.5">
             <Label htmlFor="prov">Opérateur</Label>
             <select
@@ -488,6 +600,17 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
                   {statusLabel(p, "payoutProvider")}
                 </option>
               ))}
+              {/* LE CANAL DÉJÀ ENREGISTRÉ GARDE SON ENTRÉE, MÊME S'IL N'EST PLUS
+                  PROPOSÉ. Un `select` n'affiche RIEN quand sa valeur ne figure pas
+                  parmi ses options : le vendeur qui a enregistré Wave verrait un champ
+                  vide, croirait son compte perdu, et ne comprendrait pas pourquoi. On
+                  le montre, nommé et marqué, pour qu'il soit remplaçable plutôt
+                  qu'escamoté. */}
+              {provider && !PAYOUT_PROVIDERS.some((p) => p === provider) && (
+                <option value={provider}>
+                  {statusLabel(provider, "payoutProvider")} — versement indisponible
+                </option>
+              )}
             </select>
           </div>
           <div className="space-y-1.5">
@@ -505,9 +628,11 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
               // s'apercevoir qu'on s'est trompé de compte, et un versement mal adressé
               // n'est pas récupérable par la plateforme.
               <p className="text-xs text-muted-foreground">
-                Le numéro actuel ({maskAccount(shop.payout.accountNumber)}) n&apos;est
-                volontairement pas pré-rempli : saisissez-le en entier, même si vous ne changez
-                que le titulaire.
+                {memeOperateur && (shop.payout.accountNumber ?? "").trim().length > 0
+                  ? `Laissez ce champ vide pour conserver le numéro actuel (${maskAccount(shop.payout.accountNumber)}) — utile si vous ne corrigez que le titulaire. `
+                  : `Numéro actuel : ${maskAccount(shop.payout.accountNumber)}. `}
+                Il n&apos;est volontairement pas pré-rempli : le retaper est la dernière occasion
+                de s&apos;apercevoir qu&apos;on s&apos;est trompé de compte.
               </p>
             )}
           </div>
@@ -523,6 +648,33 @@ function PayoutCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Pr
       </Dialog>
     </>
   );
+}
+
+/**
+ * ═════════════════════════════════════════════════════════════════════════════════
+ * CE QU'ON ANNONCE APRÈS UN DÉPÔT DE PIÈCE DÉPEND DU STATUT D'AVANT.
+ *
+ * Le message était fixe : « Votre dossier repasse en vérification. » Il contredisait,
+ * à quatre-vingt-dix lignes de distance, le paragraphe de cette même carte qui dit —
+ * à juste titre — que sur une boutique déjà vérifiée un ajout n'interrompt rien.
+ *
+ * `Seller.AddKybDocument` ne repasse en revue QUE depuis « non commencé » ou
+ * « refusé ». Sur une boutique vérifiée, la pièce est enregistrée et le statut ne
+ * bouge pas ; sur un dossier déjà en examen, elle rejoint simplement la pile.
+ * ═════════════════════════════════════════════════════════════════════════════════
+ */
+function messageAjoutPiece(statutAvant: string | null | undefined): string {
+  switch ((statutAvant ?? "").toLowerCase()) {
+    case "notstarted":
+    case "rejected":
+      return "Pièce ajoutée. Votre dossier repasse en vérification.";
+    case "inreview":
+      return "Pièce ajoutée au dossier, déjà en cours d'examen.";
+    case "verified":
+      return "Pièce ajoutée. La vérification de votre boutique reste acquise.";
+    default:
+      return "Pièce ajoutée à votre dossier.";
+  }
 }
 
 /** Pièces justificatives KYB. */
@@ -542,9 +694,17 @@ function KybCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promi
         body: form,
       });
     },
-    onSuccess: () => onChanged(),
+    // Le statut d'AVANT l'envoi décide de ce qu'on annonce. Le lire dans `onSuccess`
+    // donnerait celui d'après l'invalidation, c'est-à-dire pas toujours le bon.
+    onMutate: () => ({ statutAvant: shop.kybStatus }),
+    onSuccess: async (_data, _file, ctx) => {
+      await onChanged();
+      toastSuccess(messageAjoutPiece(ctx?.statutAvant));
+    },
     meta: {
-      successMessage: "Pièce ajoutée. Votre dossier repasse en vérification.",
+      // Message émis à la main juste au-dessus : il dépend du statut, et `meta` ne
+      // porte qu'une chaîne fixe.
+      successMessage: "",
       errorMessage: "La pièce n'a pas pu être téléversée.",
     },
   });
@@ -561,24 +721,104 @@ function KybCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promi
   const [link, setLink] = useState<{ doc: KybDocument; url: string } | null>(null);
 
   /**
-   * Téléchargement : le serveur renvoie une URL PRÉSIGNÉE temporaire, il ne sert pas le
-   * fichier lui-même. On demande cette URL, et jamais `fileUrl` du document — qui pointe
-   * un stockage privé et répondrait 403.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * TÉLÉCHARGEMENT : DEUX CLICS ET UNE FENÊTRE POUR UN FICHIER QU'ON A SOI-MÊME DÉPOSÉ.
    *
-   * ⚠️ On AFFICHE le lien au lieu d'ouvrir un onglet. `window.open` appelé après un
-   * `await` n'est plus rattaché au clic de l'utilisateur : les bloqueurs de fenêtres
-   * l'arrêtent, et le vendeur voit un bouton qui ne fait rien. Un lien qu'il clique
-   * lui-même passe toujours, et permet au passage de dire que l'URL expire.
+   * Le serveur renvoie une URL PRÉSIGNÉE temporaire, il ne sert pas le fichier
+   * lui-même. On demande donc cette URL — jamais `fileUrl` du document, qui pointe un
+   * stockage privé et répondrait 403.
+   *
+   * LE PROBLÈME EST RÉEL, LA PARADE ÉTAIT TROP CHÈRE. `window.open` appelé APRÈS un
+   * `await` n'est plus rattaché au clic : les bloqueurs de fenêtres l'arrêtent, et le
+   * vendeur voit un bouton qui ne fait rien. D'où l'ancienne solution — un dialogue
+   * portant un lien à cliquer — qui coûtait un second clic et une fenêtre à fermer,
+   * à chaque consultation.
+   *
+   * ON OUVRE L'ONGLET PENDANT LE CLIC, ET ON LE REMPLIT APRÈS. `window.open("")`
+   * synchrone reste rattaché au geste de l'utilisateur, donc passe les bloqueurs ; on
+   * pose l'URL dessus quand elle arrive. Si le navigateur a quand même refusé
+   * (`null`), on retombe sur le dialogue : la parade reste, elle n'est simplement plus
+   * le chemin normal.
+   *
+   * PAS DE `noopener` DANS LES OPTIONS, ET C'EST LE PIÈGE QUI A COÛTÉ UNE PREMIÈRE
+   * VERSION. La spécification HTML est explicite : quand `noopener` est demandé,
+   * `window.open` rend `null` — c'est le principe même, l'appelant ne DOIT pas garder
+   * de prise sur la fenêtre ouverte. En le passant, on obtenait donc toujours `null`,
+   * le repli sur le dialogue devenait le seul chemin, et l'onglet blanc restait ouvert
+   * par-dessus : deux clics, un dialogue, ET un onglet à fermer. Pire qu'avant.
+   *
+   * La protection contre le « reverse tabnabbing » est obtenue autrement : on efface
+   * `opener` sur la fenêtre encore vierge, avant de la faire naviguer. La page cible
+   * n'a alors aucune prise sur celle-ci.
+   * ═══════════════════════════════════════════════════════════════════════════════
    */
+  /**
+   * L'onglet ouvert ET LA PIÈCE POUR LAQUELLE il l'a été.
+   *
+   * Garder la seule fenêtre ne suffisait pas : deux clics rapprochés sur DEUX pièces
+   * différentes laissent les deux requêtes en vol, et `useMutation` exécute les deux
+   * `onSuccess`. Celui de la première trouvait alors l'onglet de la SECONDE et y
+   * affichait la première pièce ; la seconde, ne trouvant plus d'onglet, ouvrait le
+   * dialogue par-dessus. Le vendeur avait cliqué B et obtenait A, plus une fenêtre.
+   */
+  const onglet = useRef<{ id: string; win: Window | null } | null>(null);
+
   const download = useMutation({
     mutationFn: (id: string) => bff<{ url: string }>(`/seller/shop/kyb-documents/${id}/download`),
     onSuccess: (data, id) => {
+      // Réponse d'une demande abandonnée : le vendeur a cliqué autre chose depuis. On
+      // ne touche ni à l'onglet courant, qui appartient à la demande en cours, ni à
+      // l'écran.
+      if (onglet.current !== null && onglet.current.id !== id) return;
+
+      const win = onglet.current?.win ?? null;
+      onglet.current = null;
+
       const url = (data as { url?: string })?.url;
       const doc = docs.find((d) => d.id === id);
-      if (url && doc) setLink({ doc, url });
+      if (!url || !doc) {
+        win?.close();
+        // `successMessage: ""` rend cette mutation muette : sans ce toast, l'onglet
+        // s'ouvrait, se refermait, et le bouton passait pour mort.
+        toastError("Le document n'a pas pu être ouvert. Réessayez dans un instant.");
+        return;
+      }
+
+      if (win && !win.closed) {
+        win.location.replace(url);
+        return;
+      }
+
+      // Onglet refusé par le navigateur, ou refermé entre-temps : le dialogue reprend
+      // la main, avec le lien et l'avertissement sur l'expiration.
+      setLink({ doc, url });
+    },
+    onError: (_e, id) => {
+      if (onglet.current !== null && onglet.current.id !== id) return;
+      // On ne laisse pas un onglet vide ouvert derrière une erreur.
+      onglet.current?.win?.close();
+      onglet.current = null;
     },
     meta: { successMessage: "", errorMessage: "Le lien de téléchargement n'a pas pu être obtenu." },
   });
+
+  /** Ouvre l'onglet DANS le geste de clic, puis demande l'URL. L'ordre compte. */
+  function ouvrirPiece(id: string) {
+    // Un clic sur une AUTRE pièce pendant qu'une demande est en vol laisserait le
+    // premier onglet blanc derrière lui : on le referme avant d'en ouvrir un second.
+    const precedent = onglet.current?.win;
+    if (precedent && !precedent.closed) precedent.close();
+
+    const fenetre = window.open("", "_blank");
+    // On coupe le lien vers cette page avant toute navigation — ce que `noopener`
+    // aurait fait, au prix de la référence elle-même. La fenêtre est encore
+    // `about:blank`, donc de notre origine : l'écriture est permise, et le
+    // « désaveu » qu'elle pose survit à la navigation vers l'URL présignée.
+    if (fenetre) fenetre.opener = null;
+
+    onglet.current = { id, win: fenetre };
+    download.mutate(id);
+  }
 
   return (
     <>
@@ -587,11 +827,64 @@ function KybCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promi
           <CardTitle className="text-base">Pièces justificatives (KYB)</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4 p-5 pt-0">
+          {/* ═══════════════════════════════════════════════════════════════════════
+              LE MOTIF DU REFUS, LÀ OÙ TROIS ÉCRANS PROMETTAIENT DE LE TROUVER.
+
+              Le bandeau KYB envoie le vendeur ici pour lire « les motifs », et cette
+              carte ne les affichait pas : `kybRejectionReason` était servi par
+              `/seller/shop` et lu nulle part. Le vendeur re-téléversait donc la pièce
+              refusée sans savoir ce qu'on lui reprochait — exactement ce que le domaine
+              redoute en commentaire de `RejectKyb`.
+              ═══════════════════════════════════════════════════════════════════════ */}
+          {shop.kybRejectionReason?.trim() && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-500/30 dark:bg-red-950/30 dark:text-red-200">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <p className="min-w-0 break-words">
+                <strong>Motif du refus :</strong> {shop.kybRejectionReason.trim()}
+              </p>
+            </div>
+          )}
+
+          {/* CETTE PHRASE DISAIT « ajouter ou retirer une pièce remet votre dossier en
+              vérification ». Faux dans les deux sens : `Seller.AddKybDocument` ne
+              repasse en revue QUE depuis « non commencé » ou « refusé », et
+              `RemoveKybDocument` ne touche pas au statut du tout — son propre code le
+              dit en commentaire. Un vendeur déjà vérifié renonçait à corriger son
+              dossier de peur de perdre sa vérification. */}
           <p className="text-xs text-muted-foreground">
-            Ajouter ou retirer une pièce <strong>remet votre dossier en vérification</strong>. Le
-            statut affiché est celui de la boutique entière — les pièces ne sont pas examinées une
-            par une.
+            Le statut affiché est celui de la boutique entière — les pièces ne sont pas examinées
+            une par une. Déposer une première pièce, ou en redéposer après un refus, remet le
+            dossier en vérification ; sur une boutique déjà vérifiée, un ajout n&apos;interrompt
+            rien.
           </p>
+
+          {/* ═══════════════════════════════════════════════════════════════════════
+              LE RECOURS, DIT UNE SEULE FOIS ET SEULEMENT QUAND IL SERT.
+
+              Première rédaction : « déposez la nouvelle version, elle remplacera
+              l'ancienne à l'examen ». Fausse deux fois. `AddKybDocument` AJOUTE — il
+              ne cherche même pas une pièce du même type — et la périmée reste dans la
+              liste, par construction : le domaine écrit qu'elle « reste consultable,
+              ce qui est précisément l'intérêt d'un dossier de conformité ». Et sur une
+              boutique déjà vérifiée, aucun examen n'est déclenché : le statut ne bouge
+              pas, aucun événement n'est levé.
+
+              Seconde rédaction, fausse aussi : « c'est la plus récente qui fait foi ».
+              Rien ne le dit — `ApproveKyb` re-tamponne TOUTES les pièces comme
+              validées, la projection ne porte aucune notion de récence, et
+              l'administration approuve la boutique, jamais une pièce. On s'en tient
+              donc à ce qui est observable : les deux restent dans le dossier, et c'est
+              la plateforme qui tranche.
+              ═══════════════════════════════════════════════════════════════════════ */}
+          {docs.some((d) => d.verifiedAtUtc) && (
+            <p className="text-xs text-muted-foreground">
+              Une pièce déjà validée ne peut plus être retirée : elle fait partie de votre dossier
+              de conformité et doit y rester. Si elle a changé — carte renouvelée, adresse
+              différente — <strong>déposez la nouvelle version</strong> ci-dessous. Les deux
+              resteront dans la liste, avec leur date de dépôt : c&apos;est la plateforme qui
+              décide laquelle retenir lors du prochain examen.
+            </p>
+          )}
 
           {docs.length === 0 ? (
             <p className="text-sm text-muted-foreground">Aucune pièce déposée.</p>
@@ -605,6 +898,12 @@ function KybCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promi
                     </div>
                     <div className="text-xs text-muted-foreground">
                       déposée le {formatDateTime(d.uploadedAtUtc)}
+                      {d.verifiedAtUtc && (
+                        // On dit POURQUOI la corbeille a disparu. Un bouton qui
+                        // s'évapore sans un mot se lit comme un bogue d'affichage, et
+                        // le vendeur va le chercher ailleurs.
+                        <> · validée — <span className="whitespace-nowrap">non supprimable</span></>
+                      )}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
@@ -612,21 +911,39 @@ function KybCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promi
                     <Button
                       size="sm"
                       variant="ghost"
-                      onClick={() => download.mutate(d.id)}
+                      onClick={() => ouvrirPiece(d.id)}
                       disabled={download.isPending && download.variables === d.id}
                       aria-label="Télécharger"
                     >
                       <Download className="size-4" />
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="text-destructive"
-                      onClick={() => setToDelete(d)}
-                      aria-label="Supprimer"
-                    >
-                      <Trash2 className="size-4" />
-                    </Button>
+                    {/* ═══════════════════════════════════════════════════════════
+                        UNE PIÈCE VALIDÉE NE SE SUPPRIME PAS, ET LA CORBEILLE ÉTAIT
+                        PROPOSÉE SUR TOUTES.
+
+                        `Seller.RemoveKybDocument` refuse en 409 toute pièce portant
+                        `VerifiedAtUtc` : elle fait partie du dossier de conformité.
+                        Sur une boutique fraîchement vérifiée, c'est le cas de TOUTES
+                        les pièces — `ApproveKyb` les marque toutes — et le vendeur
+                        cliquait la corbeille, lisait un avertissement alarmant,
+                        confirmait, et récoltait un refus, à chaque fois. Une pièce
+                        déposée APRÈS la validation, elle, reste supprimable : c'est
+                        bien le champ qu'on lit, pas le statut de la boutique.
+
+                        Le champ arrivait pourtant dans la réponse depuis toujours ;
+                        cet écran ne le lisait simplement pas.
+                        ═══════════════════════════════════════════════════════════ */}
+                    {!d.verifiedAtUtc && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-destructive"
+                        onClick={() => setToDelete(d)}
+                        aria-label="Supprimer"
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -689,11 +1006,17 @@ function KybCard({ shop, onChanged }: { shop: SellerShop; onChanged: () => Promi
         }
       >
         {toDelete && (
+          // CE TEXTE ANNONÇAIT UNE PERTE DE VÉRIFICATION QUI N'ARRIVE PAS.
+          // `RemoveKybDocument` n'écrit jamais `KybStatus` — son propre code le dit :
+          // « Le retrait ne change pas le statut KYB de la boutique ». La peur était
+          // dissuasive : on renonçait à retirer un justificatif déposé par erreur. Et
+          // depuis que la corbeille ne s'affiche plus sur une pièce validée, le seul
+          // cas encore atteignable est celui où la phrase mentait le plus fort — une
+          // pièce ajoutée après validation, sur une boutique qui reste vérifiée.
           <p className="text-sm">
             <strong>{statusLabel(toDelete.type, "kybDocumentType")}</strong> sera retirée de votre
-            dossier, qui <strong>repassera en vérification</strong>. Si votre boutique était
-            vérifiée, elle ne le sera plus tant que la plateforme n&apos;aura pas réexaminé le
-            dossier.
+            dossier. Le statut de vérification de votre boutique n&apos;en est pas affecté ; seule
+            la pièce disparaît.
           </p>
         )}
       </Dialog>

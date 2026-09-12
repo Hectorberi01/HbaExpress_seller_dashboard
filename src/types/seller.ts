@@ -84,6 +84,38 @@ export interface SellerOrder {
   lines: SellerOrderLine[];
 }
 
+/**
+ * Un jour de la série des commandes. Décalque `SellerOrderEndpoints.SeriesAsync`.
+ *
+ * Les jours SANS commande sont présents, à zéro : c'est le serveur qui rend la grille
+ * complète, sinon une courbe relierait le 3 au 11 par une droite et donnerait à une
+ * semaine morte l'allure d'une progression.
+ */
+export interface OrderSeriesPoint {
+  /** Jour LOCAL du vendeur, « AAAA-MM-JJ » (le décalage est envoyé dans la requête). */
+  date: string;
+  /** Commandes passées ce jour-là, tous statuts confondus. */
+  orders: number;
+  /** Parmi elles, celles annulées ou en échec. */
+  cancelled: number;
+}
+
+/**
+ * Série des commandes sur une période.
+ *
+ * AUCUN MONTANT — voir la note du handler : la somme des sous-totaux de commandes
+ * n'est pas un chiffre d'affaires. Les montants se lisent dans le relevé
+ * (`SellerStatement`), seule source qui déduise commission, frais et remboursements.
+ */
+export interface SellerOrderSeries {
+  from: string;
+  to: string;
+  offsetMinutes: number;
+  /** Total de la période — pas la somme d'une page. */
+  totalOrders: number;
+  points: OrderSeriesPoint[];
+}
+
 export interface OrderShippingAddress {
   label?: string | null;
   recipient?: string | null;
@@ -364,13 +396,15 @@ export interface InventoryItem {
 /**
  * Ligne de la file d'exécution — forme ENRICHIE renvoyée par `GET /seller/shipments`.
  *
- * ⚠️ DEUX PIÈGES, tous deux dus au fait que ce handler projette un objet anonyme
+ * DEUX PIÈGES, tous deux dus au fait que ce handler projette un objet anonyme
  * (`SellerFulfillmentEndpoints.EnrichAsync`) et non le record de contrat :
  *
  *   1. La date s'appelle `createdAt`, PAS `createdAtUtc` comme partout ailleurs.
- *   2. Le statut est RENOMMÉ : « Preparing » côté domaine devient « Prepared » ici.
- *      Le détail (`GET /seller/shipments/{id}`), lui, renvoie le statut brut. Les deux
- *      vocabulaires sont donc traduits (voir `shipmentStatus` dans status-labels.ts).
+ *   2. Le statut est RENOMMÉ : « Preparing » côté domaine devient « ReadyForPickup »
+ *      ici (« Prepared » sur les serveurs antérieurs au renommage). Le détail
+ *      (`GET /seller/shipments/{id}`), lui, renvoie le statut brut. Les trois
+ *      orthographes sont traduites vers le même libellé — voir `shipmentStatus` dans
+ *      status-labels.ts.
  */
 export interface ShipmentQueueRow {
   id: string;
@@ -382,6 +416,30 @@ export interface ShipmentQueueRow {
   carrier?: string | null;
   trackingNumber?: string | null;
   trackingUrl?: string | null;
+  /**
+   * « Courier », « Carrier », ou nul tant que personne n'a emporté le colis. Le serveur
+   * le projette déjà ; il n'était pas déclaré ici. Champ RÉCENT, comme le renommage de
+   * statut qui l'accompagne : rien de ce qui le concerne n'a encore l'usure qui permet
+   * de le supposer éprouvé.
+   */
+  deliveryMode?: string | null;
+  /**
+   * ───────────────────────────────────────────────────────────────────────────────
+   * POURQUOI LE DERNIER COURSIER A RENONCÉ — NUL SI AUCUNE COURSE N'A ÉCHOUÉ.
+   *
+   * `Shipment.MarkCourierDeliveryFailed` ANNOTE l'état sans l'avancer : l'expédition
+   * reste « en préparation ». Sans ce champ, un colis qu'un coursier a abandonné est
+   * indiscernable dans la file d'un colis qu'on vient de préparer — même statut, même
+   * couleur, même silence — alors que le vendeur reçoit par ailleurs un message lui
+   * demandant d'agir. Un message d'alerte qui ne se vérifie nulle part finit par être
+   * pris pour une erreur du système.
+   *
+   * Le motif est celui que porte la course, déjà normalisé et borné à 300 caractères
+   * côté domaine. On l'affiche tel quel : le reformuler perdrait ce que le support
+   * doit lire.
+   * ───────────────────────────────────────────────────────────────────────────────
+   */
+  courierFailureReason?: string | null;
   itemCount: number;
   createdAt: string;
 }
@@ -435,24 +493,34 @@ export interface StatementLine {
 /**
  * Relevé d'une période. Décalque l'objet anonyme de `SellerFinanceEndpoints.StatementAsync`.
  *
- * ⚠️ IL N'Y A PAS DE CHAMP « NET ». Le net se calcule :
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * `netSalesXof` EST LE SEUL NET QUI VEUILLE DIRE QUELQUE CHOSE. NE LE RECALCULEZ PAS.
+ *
+ * L'écran composait autrefois son propre net :
  *   `grossSalesXof − commissionXof − providerFeeXof − refundsXof`
  *
- * C'est une soustraction d'entiers tous fournis par le serveur, pas une reconstitution
- * du barème — rien à voir avec l'app mobile, qui recalcule commission et frais à partir
- * de taux codés en dur et ment dès que le barème change.
+ * C'était une soustraction d'entiers tous fournis par le serveur — donc, croyait-on,
+ * sans risque. Elle était pourtant fausse sur toute vente remboursée : rembourser ne
+ * retire pas la ligne de gain du relevé (aucun filtre de statut côté dépôt, et la
+ * contre-passation n'écrit jamais `Reversed`). La vente gardait son brut ET sa
+ * commission, pendant que le remboursement était retranché à 100 % — donc commission et
+ * frais déduits deux fois. Une vente de 10 000 remboursée affichait −1 500 F CFA de
+ * perte pour un impact réel nul.
  *
- * En revanche le piège reste le même s'il n'est pas vu : appliquer `?? 0` à ces quatre
- * champs ferait, en cas de renommage côté serveur, apparaître un net ÉGAL au brut, en
- * gras et en vert. On les déclare donc requis et on ne les rattrape jamais par un zéro.
+ * `netSalesXof` est la somme des `SellerEarning.NetAmount`, c'est-à-dire ce qui a été
+ * RÉELLEMENT crédité. Les trois composantes restent projetées pour expliquer la
+ * décomposition, pas pour être recombinées.
  *
- * Le serveur refuse par ailleurs de servir un relevé partiel : si les remboursements
- * sont introuvables il répond 503 plutôt qu'un net surévalué.
+ * Aucun `?? 0` sur ces champs : un zéro silencieux ferait apparaître un net égal au
+ * brut, en gras et en couleur. On les déclare requis et on ne les rattrape jamais.
+ * ═══════════════════════════════════════════════════════════════════════════════════
  */
 export interface SellerStatement {
   from: string;
   to: string;
   grossSalesXof: number;
+  /** Ce qui vous a été crédité pour vos ventes de la période (brut − commission − frais). */
+  netSalesXof: number;
   commissionXof: number;
   providerFeeXof: number;
   refundsXof: number;
@@ -592,6 +660,20 @@ export interface SellerShop {
   payout?: PayoutAccount | null;
   kybDocuments: KybDocument[];
   metadata?: SellerCompanyInfo | null;
+  /**
+   * Motif du dernier refus de KYB. Le vendeur voyait « Rejected » sans savoir ce qui
+   * n'allait pas, et re-téléversait la pièce refusée.
+   */
+  kybRejectionReason?: string | null;
+  /**
+   * Suspension EN COURS : sa date et son motif. Null hors suspension.
+   *
+   * Servis par `/seller/shop` — `SellerSummary` les porte — et déclarés nulle part
+   * ici : la console envoyait donc le vendeur « contacter le support pour connaître le
+   * motif » d'une suspension dont elle tenait le motif en main.
+   */
+  suspendedOnUtc?: string | null;
+  suspensionReason?: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
@@ -644,7 +726,32 @@ export interface SellerConversation {
   id: string;
   /** Nom de l'autre participant, résolu via Identity. « Client » à défaut. */
   customer: string;
+  /**
+   * Identifiant Identity de l'autre participant — le même espace d'identifiants que
+   * `SellerOrder.buyerId` (tous deux viennent du `sub` du jeton).
+   *
+   * C'est ce qui permet à la fiche commande de retrouver LE fil de CET acheteur.
+   * Le nom ne le permet pas : il se replie sur « Client » quand Identity ne répond
+   * pas, et deux acheteurs peuvent être homonymes.
+   *
+   * Absent = serveur antérieur à cette projection ; on ne propose alors aucun lien
+   * plutôt qu'un lien au hasard.
+   */
+  counterpartId?: string | null;
+  /**
+   * CHAÎNE LIBRE DU CLIENT QUI A OUVERT LE FIL (`ContextType`), pas un libellé de la
+   * plateforme : elle vient du corps de requête, n'est validée nulle part et n'est
+   * bornée que par la colonne. L'écran l'affichait sous « À propos de : », au format
+   * d'un libellé officiel — à présenter comme une citation, jamais comme notre texte.
+   */
   subject?: string | null;
+  /**
+   * « Open », « Archived »… `SendMessage` refuse en 409 tout ce qui n'est pas `Open`,
+   * et l'archivage est accessible à N'IMPORTE QUEL participant, donc à l'acheteur. Le
+   * champ existait côté contrat ; le BFF ne le projetait pas, et l'écran laissait donc
+   * une zone de saisie sur un fil qui n'accepte plus rien.
+   */
+  status?: string | null;
   lastMessage: string;
   lastAt: string;
   unread: number;
@@ -689,10 +796,87 @@ export interface SellerMessage {
  */
 export const MESSAGE_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"] as const;
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * UN ATTRIBUT ATTENDU PAR UNE CATÉGORIE. Décalque de `CategoryAttributeSummary`.
+ *
+ * Le serveur envoyait déjà tout cela à chaque chargement de page ; la console ne le
+ * déclarait pas, donc ne le lisait pas, donc éditait les caractéristiques en clé et
+ * valeur libres pendant que le serveur, lui, contrôlait le type, les bornes et
+ * l'appartenance à une liste fermée.
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ */
+export interface CategoryAttribute {
+  /** Clé technique : à utiliser TELLE QUELLE dans les attributs du produit. */
+  key: string;
+  label: string;
+  /** « text », « number », « boolean » ou « enum ». */
+  type: string;
+  required: boolean;
+  /** Valeurs admises — type « enum » uniquement ; tableau vide sinon. */
+  values: string[];
+  unit?: string | null;
+  /** Borne inférieure pour un nombre, longueur MINIMALE pour un texte. */
+  min?: number | null;
+  /** Borne supérieure pour un nombre, longueur MAXIMALE pour un texte. */
+  max?: number | null;
+  /**
+   * Nom de la catégorie PARENTE qui déclare cet attribut, quand il est hérité. Nul
+   * pour un attribut propre à la catégorie choisie.
+   *
+   * Sert à grouper le formulaire du général au particulier — « Informatique », puis
+   * « Ordinateurs », puis « Ordinateurs portables » — plutôt que d'aligner quinze
+   * champs sans hiérarchie visible.
+   */
+  inheritedFrom?: string | null;
+}
+
 export interface SellerCategory {
   id: string;
   name: string;
   path?: string | null;
+  /**
+   * « Active » ou « Archived ». Le sélecteur proposait TOUT, y compris les catégories
+   * archivées, que `ProductAttributeGuard` refuse en 409 — après quatre étapes
+   * remplies et les photos téléversées. Le champ existait côté serveur ; il n'était
+   * pas déclaré ici.
+   */
+  status?: string | null;
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * LE SCHÉMA EFFECTIF : LA CATÉGORIE **ET TOUS SES ANCÊTRES**.
+   *
+   * Ce champ ne portait que les attributs de la catégorie elle-même. Un produit rangé
+   * dans « Informatique › Ordinateurs › Ordinateurs portables » ne se voyait donc
+   * demander que ceux de la feuille — alors que les attributs communs (marque,
+   * garantie, pays de fabrication) se posent sur les étages du haut.
+   *
+   * Rien n'échouait : la fiche partait, simplement sans les champs généraux. La perte
+   * ne se voyait qu'à la recherche à facettes, quand « filtrer par marque » ne
+   * ramenait rien sur la moitié du rayon.
+   *
+   * Vide, ou absent, = la branche n'impose aucune caractéristique.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  attributeSchema?: CategoryAttribute[] | null;
+  /**
+   * Vrai si la catégorie n'a aucune sous-catégorie.
+   *
+   * UN PRODUIT NE SE CRÉE QUE DANS UNE FEUILLE, et le serveur le refuse désormais
+   * (`catalog.product.category_not_leaf`). Ranger un ordinateur portable dans
+   * « Ordinateurs » le prive des attributs de la feuille — donc des filtres par
+   * lesquels l'acheteur le cherche — sans qu'aucune erreur ne le signale.
+   *
+   * Absent = serveur antérieur à cette règle : on traite alors comme une feuille
+   * plutôt que de bloquer toutes les catégories.
+   */
+  isLeaf?: boolean;
+  /**
+   * Faux = toute clé hors schéma fait échouer l'enregistrement ENTIER de la fiche.
+   * Vrai par défaut côté serveur : un schéma décrit ce qu'on attend, pas
+   * nécessairement tout ce qui est permis.
+   */
+  allowUnknownAttributes?: boolean;
 }
 
 export interface SellerBrand {

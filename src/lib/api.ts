@@ -4,6 +4,15 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /**
+     * Code métier du serveur (`identity.auth.email_not_verified`, …), quand il est
+     * connu. Il vit dans le `title` d'un ProblemDetails ASP.NET.
+     *
+     * Facultatif à dessein : la très grande majorité des appels n'a besoin que du
+     * message. Il n'est lu que là où deux refus partagent le même statut HTTP et
+     * appellent deux conduites différentes.
+     */
+    public code?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -56,6 +65,41 @@ function redirectIfSessionExpired(res: Response, data: unknown): void {
   throw new ApiError(401, "Session expirée. Reconnexion…");
 }
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * `message` AVANT `error` : LE CODE MACHINE NE DOIT PAS PASSER DEVANT LA PHRASE.
+ *
+ * Les refus métier du BFF sortent en `application/problem+json` et portent `detail`.
+ * Mais les refus posés à la main par le BFF vendeur ont une autre forme :
+ *
+ *     ShopNotAllowed → { error: "shop_not_allowed", status, message: DenialReason(...) }
+ *     NotASeller     → { error: "not_a_seller", hint: "..." }
+ *
+ * La chaîne s'arrêtait sur `error` et le bandeau affichait « shop_not_allowed » — le
+ * `message`, seul champ rédigé pour un humain, et la raison même d'exister de
+ * `SellerRights.DenialReason`, n'était jamais lu. L'app mobile, elle, lit bien
+ * `data['message']` : la console était la seule des deux à perdre le motif.
+ *
+ * `error` reste en dernier recours : d'autres routes y mettent une phrase complète
+ * (« Au moins une image est requise. »). On le garde donc, mais derrière `message`.
+ *
+ * On refuse aussi les valeurs non textuelles : `error` peut être un objet de
+ * validation, et « [object Object] » dans un bandeau ne vaut pas mieux qu'un code.
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ */
+function messageDErreur(data: unknown, status: number): string {
+  const repli = `Erreur ${status}`;
+  if (!data || typeof data !== "object") {
+    return typeof data === "string" && data.trim() ? data : repli;
+  }
+  const champs = data as Record<string, unknown>;
+  for (const cle of ["detail", "title", "message", "error"]) {
+    const v = champs[cle];
+    if (typeof v === "string" && v.trim()) return v;
+  }
+  return repli;
+}
+
 /** Appel authentifié d'un endpoint du BFF vendeur, relayé par le proxy Next. */
 export async function bff<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -92,14 +136,7 @@ export async function bff<T = unknown>(path: string, init?: RequestInit): Promis
   redirectIfSessionExpired(res, data);
 
   if (!res.ok) {
-    const msg =
-      (data &&
-        typeof data === "object" &&
-        ((data as Record<string, string>).detail ??
-          (data as Record<string, string>).title ??
-          (data as Record<string, string>).error)) ||
-      `Erreur ${res.status}`;
-    throw new ApiError(res.status, typeof msg === "string" ? msg : `Erreur ${res.status}`);
+    throw new ApiError(res.status, messageDErreur(data, res.status));
   }
   return data as T;
 }
@@ -124,14 +161,7 @@ export async function bffBlob(path: string, init?: RequestInit): Promise<Blob> {
     // se déguise pas en échec de traitement d'image.
     redirectIfSessionExpired(res, data);
 
-    const msg =
-      (data &&
-        typeof data === "object" &&
-        ((data as Record<string, string>).detail ??
-          (data as Record<string, string>).title ??
-          (data as Record<string, string>).error)) ||
-      `Erreur ${res.status}`;
-    throw new ApiError(res.status, typeof msg === "string" ? msg : `Erreur ${res.status}`);
+    throw new ApiError(res.status, messageDErreur(data, res.status));
   }
 
   const blob = await res.blob();
@@ -165,14 +195,43 @@ export async function apiLogin(
     email?: string;
     mfaRequired?: boolean;
     error?: string;
+    code?: string;
   };
   if (res.status === 401 && data?.mfaRequired) return { mfaRequired: true };
-  if (!res.ok) throw new ApiError(res.status, data?.error ?? "Connexion impossible.");
+  if (!res.ok) throw new ApiError(res.status, data?.error ?? "Connexion impossible.", data?.code);
   return data;
 }
 
 export async function apiLogout(): Promise<void> {
   await fetch("/api/auth/logout", { method: "POST" });
+}
+
+/**
+ * Réaligne l'identité d'AFFICHAGE de la session (nom du bandeau latéral) sur le
+ * profil réellement enregistré.
+ *
+ * Ce nom est posé dans le cookie de session à la CONNEXION, pas relu à chaque écran :
+ * ni l'invalidation d'une clé React Query ni un `router.refresh()` seul ne le
+ * changent. Voir la note du handler `POST /api/auth/session`.
+ *
+ * Aucun corps : c'est le serveur qui relit le compte.
+ *
+ * RENVOIE `false` QUAND LE NOM N'A PAS PU ÊTRE RÉALIGNÉ. Un échec silencieux ramenait
+ * le défaut d'origine à l'identique : enregistrement réussi, bandeau périmé, aucun
+ * signe — et aucun moyen de réessayer, puisque « Enregistrer » redevient inactif dès
+ * que le formulaire est à jour. L'appelant doit donc le dire. Ce n'est PAS un échec
+ * d'enregistrement : le profil, lui, est bien écrit.
+ */
+export async function refreshSessionIdentity(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/auth/session", { method: "POST", cache: "no-store" });
+    if (!res.ok) return false;
+    const data = (await res.json().catch(() => null)) as { resynchronise?: boolean } | null;
+    return data?.resynchronise === true;
+  } catch {
+    // Réseau indisponible : on laisse le nom précédent, et on le signale.
+    return false;
+  }
 }
 
 export async function fetchSession(): Promise<SessionState> {

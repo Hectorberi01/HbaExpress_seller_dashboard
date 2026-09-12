@@ -26,6 +26,27 @@
     --ring: 158 64% 34%;
     --radius: 0.9rem;
 
+    /* ═══════════════════════════════════════════════════════════════════════════
+       COULEURS DE SÉRIES DES GRAPHES.
+
+       Elles ne sont PAS dérivées du vert de marque, et ce n'est pas un oubli. Le
+       couple « vert marque + orange » a été mesuré : écart perceptif de 6,8 en
+       vision protanope (seuil de sécurité : 8), c'est-à-dire deux courbes
+       confondues pour une partie des vendeurs. Le couple bleu + orange retenu ici
+       mesure 24,7. Le vert de marque reste celui des boutons et des accents ; il ne
+       porte pas de donnée.
+
+       Les pas SOMBRES ne sont pas les mêmes teintes assombries automatiquement :
+       ils sont choisis pour la surface sombre et validés contre elle.
+
+       Toute modification de ces six valeurs doit repasser le validateur de palette
+       (bande de clarté, plancher de chroma, séparation en vision déficiente,
+       contraste sur la surface) — à l'œil, on ne voit pas ce qui se confond.
+       ═══════════════════════════════════════════════════════════════════════════ */
+    --viz-series-1: #2a78d6;
+    --viz-series-2: #eb6834;
+    --viz-series-3: #1baf7a;
+
     /* Ombres neumorphiques (source de lumière en haut-gauche).
        Teinte d'ombre éclaircie vers le blanc (gris neutre quasi-blanc, sans bleu). */
     --nm-light: 255 255 255;
@@ -93,6 +114,12 @@
     --border: 217.2 32.6% 20%;
     --input: 217.2 32.6% 20%;
     --ring: 158 64% 42%;
+
+    /* Pas SOMBRES des séries — voir la note du thème clair. Choisis pour la surface
+       sombre, pas obtenus en assombrissant les précédents. */
+    --viz-series-1: #3987e5;
+    --viz-series-2: #d95926;
+    --viz-series-3: #199e70;
   }
 }
 

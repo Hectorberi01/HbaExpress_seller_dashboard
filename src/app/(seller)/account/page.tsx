@@ -2,7 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiLogout, bff } from "@/lib/api";
+import { useRouter } from "next/navigation";
+import { apiLogout, bff, refreshSessionIdentity } from "@/lib/api";
+import { toast } from "@/lib/toast";
 import { formatDateTime } from "@/lib/utils";
 import { accountTone, statusLabel } from "@/lib/status-labels";
 import { Badge } from "@/components/ui/badge";
@@ -63,6 +65,7 @@ export default function AccountPage() {
 }
 
 function IdentityCard({ me, onChanged }: { me: SellerAccount; onChanged: () => Promise<unknown> }) {
+  const router = useRouter();
   const [form, setForm] = useState({
     firstName: me.firstName,
     lastName: me.lastName,
@@ -84,7 +87,36 @@ function IdentityCard({ me, onChanged }: { me: SellerAccount; onChanged: () => P
           phoneNumber: toStoredPhone(form.phoneNumber),
         }),
       }),
-    onSuccess: () => onChanged(),
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LE BANDEAU LATÉRAL NE LIT PAS CETTE REQUÊTE.
+    //
+    // Le nom affiché en bas du menu vient du COOKIE de session, écrit à la connexion
+    // et rendu par le layout serveur. Invalider « seller-account » rafraîchissait donc
+    // le formulaire et rien d'autre : le vendeur corrigeait son nom, voyait le champ
+    // changer, et gardait l'ancien dans le menu jusqu'à sa prochaine connexion.
+    //
+    // L'ORDRE EST LE FOND DU CORRECTIF : on réécrit d'abord le cookie côté serveur
+    // (`refreshSessionIdentity`), on redemande le rendu ensuite (`router.refresh()`).
+    // L'inverse relirait l'ancien cookie et n'afficherait toujours rien de neuf.
+    // ═══════════════════════════════════════════════════════════════════════════
+    onSuccess: async () => {
+      await onChanged();
+      const realigne = await refreshSessionIdentity();
+      if (!realigne) {
+        // Le profil EST enregistré — on ne le remet pas en cause. Seul le nom du menu
+        // n'a pas suivi, et le vendeur doit le savoir plutôt que de croire à un bug.
+        // « Profil enregistré. » a DÉJÀ été annoncé : en React Query 5, le
+        // `MutationCache.onSuccess` global (providers.tsx) s'exécute AVANT le
+        // `onSuccess` de la mutation. Le répéter ici afficherait deux bandeaux
+        // commençant par la même phrase, empilés.
+        toast(
+          "Le nom affiché dans le menu n'a pas pu être mis à jour ; il le sera à votre prochaine connexion.",
+          "info",
+          9000,
+        );
+      }
+      router.refresh();
+    },
     meta: { successMessage: "Profil enregistré.", errorMessage: "Le profil n'a pas pu être enregistré." },
   });
 
@@ -531,9 +563,65 @@ function DangerCard({ me, onChanged }: { me: SellerAccount; onChanged: () => Pro
     },
   });
 
-  const closed = shopStatus === "closed";
   /** Tant que le statut boutique est inconnu, on ne propose ni fermeture ni réactivation. */
   const shopKnown = shopStatus !== undefined;
+
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * CETTE ZONE NE CONNAISSAIT QUE DEUX ÉTATS. LE DOMAINE EN A CINQ.
+   *
+   * `closed = shopStatus === "closed"` décidait de tout : fermée → « Demander la
+   * réactivation », tout le reste → « Fermer ». Or `Seller.RequestClosure` refuse en
+   * 409 sur `PendingReactivation` ET sur `Suspended`, et `RequestReactivation` exige
+   * `Closed` — donc dans ces deux états, le SEUL bouton proposé était celui que le
+   * serveur allait refuser.
+   *
+   * LE MOMENT ÉTAIT PRÉVISIBLE, ce qui rend le défaut d'autant plus fâcheux : juste
+   * après avoir cliqué « Demander la réactivation », la boutique passe en
+   * `PendingReactivation`, l'invalidation rafraîchit le statut, et le bouton bascule
+   * sur « Fermer ». Le vendeur qui venait de demander sa réactivation ne lisait nulle
+   * part qu'elle était en cours d'examen, et l'unique geste offert échouait.
+   *
+   * LES MESSAGES DISENT LA MÊME CHOSE QUE `SellerRights.DenialReason`, sans le
+   * recopier mot pour mot : ce sont deux publics — là-bas un refus opposé à une
+   * action, ici une explication d'état. Ce qui ne doit PAS diverger, c'est le fond.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const kyb = (shopQ.data?.kybStatus ?? "").toLowerCase();
+  const fermeture:
+    | { geste: "fermer" }
+    | { geste: "reactiver" }
+    | { geste: "aucun"; message: string } =
+    shopStatus === "closed"
+      ? { geste: "reactiver" }
+      : shopStatus === "pendingreactivation"
+        ? {
+            geste: "aucun",
+            // « Vous n'avez rien d'autre à faire » était FAUX : `ApproveReactivation`
+            // exige `KybStatus == Verified` en plus de la demande. Un vendeur au KYB
+            // refusé ou jamais déposé attendait donc une validation qui ne pouvait pas
+            // venir, en lisant qu'il n'avait rien à faire.
+            message:
+              kyb === "verified"
+                ? "Votre demande de réactivation est en cours d'examen. La vente reprendra dès sa validation — vous n'avez rien d'autre à faire."
+                : kyb === "inreview"
+                  ? "Votre demande de réactivation est en cours d'examen, et votre dossier KYB aussi. La réactivation ne peut aboutir qu'une fois le KYB validé — vos pièces sont déjà entre les mains de la plateforme, vous n'avez rien à redéposer."
+                  : "Votre demande de réactivation est en cours d'examen, mais elle ne pourra pas aboutir tant que votre dossier KYB n'est pas validé. Déposez vos pièces dans Ma boutique, section Documents KYB.",
+          }
+        : shopStatus === "suspended"
+          ? {
+              geste: "aucun",
+              // On ne dit plus « vos gains ne sont pas perdus » tout court : c'est vrai
+              // — rien n'est confisqué — mais `CanWithdraw` refuse le retrait pendant
+              // la suspension. Dire la moitié rassurante enverrait le vendeur cliquer
+              // « Demander un retrait » pour rien.
+              message:
+                (shopQ.data?.suspensionReason?.trim()
+                  ? `Votre boutique est suspendue — motif : ${shopQ.data.suspensionReason.trim()}. `
+                  : "Votre boutique est suspendue. ") +
+                "Une suspension se lève par décision de la plateforme : contactez le support pour connaître les suites. Vos retraits sont gelés le temps de l'instruction — vos gains ne sont pas perdus, ils attendent la décision.",
+            }
+          : { geste: "fermer" };
 
   return (
     <>
@@ -544,10 +632,19 @@ function DangerCard({ me, onChanged }: { me: SellerAccount; onChanged: () => Pro
         <CardContent className="space-y-4 p-5 pt-0">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0">
-              <div className="text-sm font-medium">Fermer la boutique</div>
-              <p className="text-xs text-muted-foreground">
-                Vos produits sont retirés de la vente. Votre compte reste actif et vous pouvez
-                demander une réactivation.
+              <div className="text-sm font-medium">
+                {fermeture.geste === "reactiver"
+                  ? "Rouvrir la boutique"
+                  : fermeture.geste === "fermer"
+                    ? "Fermer la boutique"
+                    : "État de votre boutique"}
+              </div>
+              <p className="min-w-0 break-words text-xs text-muted-foreground">
+                {fermeture.geste === "aucun"
+                  ? fermeture.message
+                  : fermeture.geste === "reactiver"
+                    ? "Votre boutique est fermée. Une demande de réactivation la remet en vente après examen de la plateforme."
+                    : "Vos produits sont retirés de la vente. Votre compte reste actif et vous pouvez demander une réactivation."}
               </p>
             </div>
             {!shopKnown ? (
@@ -556,16 +653,19 @@ function DangerCard({ me, onChanged }: { me: SellerAccount; onChanged: () => Pro
               <Button variant="outline" disabled>
                 {shopQ.isLoading ? "Chargement…" : "État indisponible"}
               </Button>
-            ) : closed ? (
+            ) : fermeture.geste === "reactiver" ? (
               <Button variant="outline" onClick={() => reactivate.mutate()} disabled={reactivate.isPending}>
                 {reactivate.isPending && <Loader2 className="size-4 animate-spin" />}
                 Demander la réactivation
               </Button>
-            ) : (
+            ) : fermeture.geste === "fermer" ? (
               <Button variant="outline" onClick={() => setCloseOpen(true)}>
                 Fermer
               </Button>
-            )}
+            ) : null}
+            {/* AUCUN BOUTON, ET C'EST LA BONNE RÉPONSE. Dans ces deux états, la
+                plateforme seule décide de la suite : offrir un geste reviendrait à
+                promettre une prise sur une décision qui n'appartient pas au vendeur. */}
           </div>
 
           <div className="flex flex-wrap items-start justify-between gap-3 border-t border-border pt-4">

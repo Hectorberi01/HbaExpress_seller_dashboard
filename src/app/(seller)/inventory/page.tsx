@@ -3,10 +3,12 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
+import { useDroitDeVendre } from "@/lib/selling";
+import { useAutoChoisirUnique } from "@/lib/auto-choice";
 import { shortId } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -15,7 +17,13 @@ import { LocationField, mapUrl, type GeoPoint } from "@/components/location-fiel
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { QueryError } from "@/components/query-error";
 import { PageNote } from "@/components/page-note";
-import type { FulfillmentLocation, InventoryItem } from "@/types/seller";
+import { ReadOnlyNote } from "@/components/read-only-note";
+import type {
+  FulfillmentLocation,
+  InventoryItem,
+  SellerOffer,
+  SellerProduct,
+} from "@/types/seller";
 import { AlertTriangle, Loader2, MapPin, PackagePlus, Plus, Search, SlidersHorizontal } from "lucide-react";
 
 /**
@@ -29,11 +37,55 @@ function locationLabel(l: { communeName: string; landmark?: string | null; line?
   return detail ? `${l.communeName} — ${detail}` : l.communeName;
 }
 
+/**
+ * ═════════════════════════════════════════════════════════════════════════════════
+ * « J'AI CRÉÉ MON ENTREPÔT, ET IL N'APPARAÎT PAS DANS LE TABLEAU. »
+ *
+ * Il n'y apparaîtra jamais : CE TABLEAU LISTE DES RÉFÉRENCES SUIVIES, PAS DES
+ * ENTREPÔTS. L'entrepôt est une colonne de ce tableau, pas une de ses lignes — il se
+ * consulte par le bouton « Entrepôts ».
+ *
+ * Le malentendu venait entièrement d'ici. Tant qu'aucun entrepôt n'existe, la page
+ * affiche une carte qui explique quoi faire ; dès le premier créé, cette carte
+ * disparaît et il ne reste que « Aucune référence suivie. » — trois mots qui, juste
+ * après une création réussie, se lisent comme « votre création n'a rien donné ».
+ *
+ * On dit donc les deux choses que le vendeur cherche à ce moment précis : que ses
+ * entrepôts sont bien enregistrés, et ce qu'il reste à faire pour remplir ce tableau.
+ * ═════════════════════════════════════════════════════════════════════════════════
+ */
+function VideSansReference({ entrepots }: { entrepots: number }) {
+  if (entrepots === 0) {
+    // La carte « Aucun entrepôt déclaré », au-dessus, porte déjà l'explication et le
+    // bouton. La répéter ici donnerait deux appels à l'action pour un seul geste.
+    return <>Aucune référence suivie.</>;
+  }
+
+  return (
+    <span className="mx-auto block max-w-md space-y-1.5">
+      <span className="block font-medium text-foreground">Aucune référence suivie.</span>
+      <span className="block">
+        {entrepots === 1 ? "Votre entrepôt est bien enregistré" : `Vos ${entrepots} entrepôts sont bien enregistrés`}
+        {" — ce tableau ne les liste pas, il liste les SKU dont vous suivez le stock, un par "}
+        entrepôt. Le bouton « Entrepôts » les affiche et permet de les corriger.
+      </span>
+      <span className="block">
+        Pour remplir ce tableau, ouvrez une référence avec « Suivre une référence » : le stock se
+        déclare sur une déclinaison de vos fiches produit, qu&apos;elle soit déjà mise en vente
+        ou non.
+      </span>
+    </span>
+  );
+}
+
 export default function InventoryPage() {
   const qc = useQueryClient();
+  const droit = useDroitDeVendre();
   const [search, setSearch] = useState("");
   const [onlyLow, setOnlyLow] = useState(false);
   const [pane, setPane] = useState<"none" | "location" | "item">("none");
+  /** Incrémenté à chaque ouverture du dialogue « Suivre une référence » — voir sa clé. */
+  const [ouvertures, setOuvertures] = useState(0);
   const [editId, setEditId] = useState<string | null>(null);
 
   const items = useQuery({
@@ -90,10 +142,18 @@ export default function InventoryPage() {
             <MapPin className="size-4" /> Entrepôts
           </Button>
           {/* Désactivé faute d'entrepôt, PAS faute d'avoir pu les charger : sur erreur
-              on laisse le bouton actif, le dialogue expliquera. */}
+              on laisse le bouton actif, le dialogue expliquera.
+
+              `title` RETIRÉ : `disabled:pointer-events-none` (components/ui/button.tsx)
+              empêche tout survol sur un bouton désactivé, donc l'infobulle ne
+              s'affichait jamais — ni à la souris, ni au doigt. Le motif est dans le
+              bandeau juste en dessous. */}
           <Button
-            onClick={() => setPane("item")}
-            disabled={!locations.isError && (locations.data ?? []).length === 0}
+            onClick={() => {
+              setOuvertures((n) => n + 1);
+              setPane("item");
+            }}
+            disabled={droit.bloque || (!locations.isError && (locations.data ?? []).length === 0)}
           >
             <PackagePlus className="size-4" /> Suivre une référence
           </Button>
@@ -108,6 +168,34 @@ export default function InventoryPage() {
 
       <QueryError of={[items, locations]} />
 
+      {/* ═══════════════════════════════════════════════════════════════════════════
+          LE DROIT D'ÉCRIRE, DIT UNE FOIS EN HAUT PLUTÔT QU'À CHAQUE BOUTON.
+
+          Les écritures de cet écran — suivi d'une référence, réception, ajustement,
+          seuil, entrepôts — passent toutes par `ResolveSellingSellerAsync`
+          (`SellerInventoryEndpoints` : `GuardItemAsync` pour les articles, appel
+          direct pour les lieux). Sans ce bandeau, une boutique suspendue ou fermée
+          découvrait le refus bouton par bouton, APRÈS avoir saisi.
+
+          La LECTURE reste ouverte, et l'écran la garde ouverte : le tableau, la liste
+          des entrepôts et la carte restent consultables.
+          ═══════════════════════════════════════════════════════════════════════════ */}
+      {droit.bloque && (
+        <Card className="mb-4 p-4 text-sm">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <div className="space-y-1">
+              <p className="font-medium">Modifications indisponibles</p>
+              <p className="text-muted-foreground">{droit.raison}</p>
+              <p className="text-muted-foreground">
+                Vous pouvez toujours consulter vos stocks et vos entrepôts ; seules les
+                écritures sont suspendues.
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {/* Un stock ne peut exister sans entrepôt : le dire plutôt que d'afficher un
           tableau vide qu'on ne saurait pas remplir. */}
       {!locations.isLoading && !locations.isError && (locations.data ?? []).length === 0 && (
@@ -121,7 +209,13 @@ export default function InventoryPage() {
                 suivre vos références — c&apos;est aussi ce lieu qui sert d&apos;adresse de départ à
                 vos offres.
               </p>
-              <Button size="sm" variant="outline" className="mt-3" onClick={() => setPane("location")}>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-3"
+                onClick={() => setPane("location")}
+                disabled={droit.bloque}
+              >
                 <Plus className="size-4" /> Créer un entrepôt
               </Button>
             </div>
@@ -176,11 +270,13 @@ export default function InventoryPage() {
             ) : rows.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  {onlyLow
-                    ? "Aucune référence sous son seuil d'alerte."
-                    : search
-                      ? "Aucune référence ne correspond."
-                      : "Aucune référence suivie."}
+                  {onlyLow ? (
+                    "Aucune référence sous son seuil d'alerte."
+                  ) : search ? (
+                    "Aucune référence ne correspond."
+                  ) : (
+                    <VideSansReference entrepots={(locations.data ?? []).length} />
+                  )}
                 </TableCell>
               </TableRow>
             ) : (
@@ -215,7 +311,15 @@ export default function InventoryPage() {
                     {i.reorderThreshold}
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button size="sm" variant="ghost" onClick={() => setEditId(i.id)}>
+                    {/* Le dialogue « Gérer » ne contient QUE des écritures — réception,
+                        ajustement, seuil — toutes gardées par `GuardItemAsync`. Rien à
+                        y lire que la ligne du tableau ne montre déjà. */}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setEditId(i.id)}
+                      disabled={droit.bloque}
+                    >
                       <SlidersHorizontal className="size-4" /> Gérer
                     </Button>
                   </TableCell>
@@ -232,10 +336,18 @@ export default function InventoryPage() {
         locations={locations.data ?? []}
         loading={locations.isLoading}
         failed={locations.isError}
+        lectureSeule={droit.bloque}
         onChanged={() => qc.invalidateQueries({ queryKey: ["seller-locations"] })}
       />
 
+      {/* `key` REMONTÉE À CHAQUE OUVERTURE, comme le fait déjà le dialogue de mise en
+          vente. Ce dialogue reste monté en permanence : sans clé, l'état interne du
+          hook de présélection survivait à `reset()`, et la deuxième référence suivie
+          d'affilée se retrouvait sans entrepôt présélectionné alors que la première
+          l'avait eu. Deux comportements pour le même geste, selon qu'on l'a déjà fait
+          ou non. */}
       <CreateItemDialog
+        key={`item-${ouvertures}`}
         open={pane === "item"}
         onClose={() => setPane("none")}
         locations={locations.data ?? []}
@@ -254,6 +366,7 @@ function LocationsDialog({
   locations,
   loading,
   failed,
+  lectureSeule = false,
   onChanged,
 }: {
   open: boolean;
@@ -261,6 +374,12 @@ function LocationsDialog({
   locations: FulfillmentLocation[];
   loading: boolean;
   failed: boolean;
+  /**
+   * La boutique n'a plus le droit d'écrire. Créer, corriger et supprimer un lieu
+   * passent par `ResolveSellingSellerAsync` ; la LISTE, elle, reste servie — ce
+   * dialogue reste donc ouvrable, avec ses seules commandes neutralisées.
+   */
+  lectureSeule?: boolean;
   onChanged: () => Promise<unknown>;
 }) {
   const [communeCode, setCommuneCode] = useState("");
@@ -270,27 +389,76 @@ function LocationsDialog({
   const [line, setLine] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<FulfillmentLocation | null>(null);
 
-  const create = useMutation({
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * UNE ADRESSE D'ENTREPÔT NE POUVAIT PAS ÊTRE CORRIGÉE DU TOUT.
+   *
+   * Le BFF ne montait que `GET`, `POST` et `DELETE` sur `/seller/locations`. Une faute
+   * dans un quartier, un point de repère devenu faux, un déménagement : la seule
+   * manœuvre était de supprimer puis recréer — ce que le serveur REFUSE tant qu'une
+   * référence est suivie à cet endroit. Un vendeur avec du stock était donc enfermé
+   * avec son adresse fausse, celle-là même que reçoit le coursier à chaque commande.
+   *
+   * La route `PUT` existe désormais (le module avait déjà la commande, sans porte).
+   * Ce formulaire sert à la création ET à la correction : deux formulaires jumeaux
+   * auraient divergé au premier champ ajouté.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const [enEdition, setEnEdition] = useState<FulfillmentLocation | null>(null);
+
+  function chargerPourEdition(l: FulfillmentLocation) {
+    setEnEdition(l);
+    setCommuneCode(l.communeCode ?? "");
+    setQuartier(l.quartier ?? "");
+    setLandmark(l.landmark ?? "");
+    setLine(l.line ?? "");
+    setPoint(
+      l.latitude != null && l.longitude != null
+        ? { latitude: l.latitude, longitude: l.longitude }
+        : null,
+    );
+  }
+
+  function viderFormulaire() {
+    setEnEdition(null);
+    setCommuneCode("");
+    setQuartier("");
+    setLandmark("");
+    setPoint(null);
+    setLine("");
+  }
+
+  /** Le corps est identique pour la création et la correction. */
+  function corpsAdresse() {
+    return JSON.stringify({
+      // Le serveur attend « commune » et accepte code ou libellé. On envoie le code.
+      commune: communeCode,
+      quartier: quartier.trim() || null,
+      landmark: landmark.trim(),
+      line: line.trim() || null,
+      latitude: point?.latitude ?? null,
+      longitude: point?.longitude ?? null,
+    });
+  }
+
+  const update = useMutation({
     mutationFn: () =>
-      bff("/seller/locations", {
-        method: "POST",
-        body: JSON.stringify({
-          // Le serveur attend « commune » et accepte code ou libellé. On envoie le code.
-          commune: communeCode,
-          quartier: quartier.trim() || null,
-          landmark: landmark.trim(),
-          line: line.trim() || null,
-          // Plus de `null` en dur : la position part quand le vendeur en a posé une.
-          latitude: point?.latitude ?? null,
-          longitude: point?.longitude ?? null,
-        }),
-      }),
+      bff(`/seller/locations/${enEdition?.id}`, { method: "PUT", body: corpsAdresse() }),
     onSuccess: async () => {
-      setCommuneCode("");
-      setQuartier("");
-      setLandmark("");
-      setPoint(null);
-      setLine("");
+      viderFormulaire();
+      await onChanged();
+    },
+    meta: {
+      successMessage: "Adresse corrigée.",
+      errorMessage: "L'adresse n'a pas pu être corrigée.",
+    },
+  });
+
+  const create = useMutation({
+    // La position part quand le vendeur en a posé une (plus de `null` en dur).
+    mutationFn: () => bff("/seller/locations", { method: "POST", body: corpsAdresse() }),
+    onSuccess: async () => {
+      viderFormulaire();
       await onChanged();
     },
     meta: { successMessage: "Entrepôt créé.", errorMessage: "L'entrepôt n'a pas pu être créé." },
@@ -310,7 +478,23 @@ function LocationsDialog({
     },
   });
 
-  const busy = create.isPending || remove.isPending;
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // DEUX DRAPEAUX, ET SURTOUT PAS UN SEUL.
+  //
+  // Première rédaction : `busy = lectureSeule || ...`, au motif que toutes les
+  // commandes d'écriture portent déjà `busy`. C'ÉTAIT UN PIÈGE À VENDEUR : `busy`
+  // garde aussi la FERMETURE du dialogue (`onClose={() => !busy && onClose()}`), et
+  // `components/ui/dialog.tsx` n'a aucune autre sortie — Échap, le voile et la croix
+  // passent tous par cette même prop, et `lockScroll()` bloque en plus le défilement
+  // de la page derrière. En lecture seule, `busy` restait vrai en permanence : le
+  // vendeur ouvrait « Entrepôts » pour CONSULTER sa liste — ce que l'écran l'invite
+  // explicitement à faire — et ne pouvait plus en sortir autrement qu'en rechargeant.
+  //
+  // `busy` reste donc ce qu'il était : une mutation est en cours. `ecrituresBloquees`
+  // dit autre chose : le droit d'écrire manque.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const busy = create.isPending || remove.isPending || update.isPending;
+  const ecrituresBloquees = lectureSeule || busy;
   // La rue n'est PAS exigée : au Bénin, beaucoup de lieux n'en ont pas. Ce sont la
   // commune et le point de repère qui rendent l'entrepôt trouvable par un coursier.
   const canCreate = communeCode.length > 0 && landmark.trim().length > 0;
@@ -324,6 +508,15 @@ function LocationsDialog({
         description="Lieux depuis lesquels vous expédiez. Chaque offre en désigne un."
       >
         <div className="space-y-4">
+          {/* Le bandeau de la page est DERRIÈRE le voile de la modale : sans ce rappel,
+              le vendeur voyait un formulaire d'adresse entièrement saisissable et un
+              bouton grisé, sans nulle part où lire pourquoi. */}
+          {lectureSeule && (
+            <ReadOnlyNote>
+              Votre boutique ne peut pas modifier ses entrepôts dans son état actuel. La liste
+              ci-dessous reste consultable.
+            </ReadOnlyNote>
+          )}
           <div>
             {loading ? (
               <p className="text-sm text-muted-foreground">Chargement…</p>
@@ -359,15 +552,25 @@ function LocationsDialog({
                         )}
                       </div>
                     </div>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="text-destructive"
-                      onClick={() => setConfirmDelete(l)}
-                      disabled={busy}
-                    >
-                      Supprimer
-                    </Button>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => chargerPourEdition(l)}
+                        disabled={ecrituresBloquees}
+                      >
+                        Corriger
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-destructive"
+                        onClick={() => setConfirmDelete(l)}
+                        disabled={ecrituresBloquees}
+                      >
+                        Supprimer
+                      </Button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -407,10 +610,32 @@ function LocationsDialog({
               </p>
             </div>
             <LocationField value={point} onChange={setPoint} />
-            <div className="flex justify-end">
-              <Button size="sm" onClick={() => create.mutate()} disabled={busy || !canCreate}>
-                {create.isPending && <Loader2 className="size-4 animate-spin" />}
-                <Plus className="size-4" /> Ajouter cet entrepôt
+            {enEdition && (
+              <p className="rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
+                Vous corrigez <strong>{locationLabel(enEdition)}</strong>. Les offres et le stock
+                rattachés à cet entrepôt ne bougent pas : c&apos;est la même adresse qu&apos;on
+                réécrit, sous le même identifiant.
+              </p>
+            )}
+            <div className="flex justify-end gap-2">
+              {enEdition && (
+                <Button size="sm" variant="ghost" onClick={viderFormulaire} disabled={busy}>
+                  Annuler la correction
+                </Button>
+              )}
+              <Button
+                size="sm"
+                onClick={() => (enEdition ? update.mutate() : create.mutate())}
+                disabled={ecrituresBloquees || !canCreate}
+              >
+                {(create.isPending || update.isPending) && <Loader2 className="size-4 animate-spin" />}
+                {enEdition ? (
+                  "Enregistrer la correction"
+                ) : (
+                  <>
+                    <Plus className="size-4" /> Ajouter cet entrepôt
+                  </>
+                )}
               </Button>
             </div>
           </div>
@@ -430,7 +655,7 @@ function LocationsDialog({
             <Button
               variant="destructive"
               onClick={() => confirmDelete && remove.mutate(confirmDelete.id)}
-              disabled={busy}
+              disabled={ecrituresBloquees}
             >
               {remove.isPending && <Loader2 className="size-4 animate-spin" />}
               Supprimer
@@ -477,6 +702,92 @@ function CreateItemDialog({
   const [locationId, setLocationId] = useState("");
   const [onHand, setOnHand] = useState("0");
   const [threshold, setThreshold] = useState("5");
+
+  // ───────────────────────────────────────────────────────────────────────────────
+  // ON NE TAPE PLUS UN SKU, ON LE CHOISIT PARMI LES SIENS.
+  //
+  // Le champ était libre, sous une phrase qui affirmait « doit correspondre au SKU
+  // d'une variante de votre catalogue » — une règle que RIEN ne faisait respecter, ni
+  // ici ni côté serveur. Une lettre de travers créait une ligne de stock orpheline,
+  // parfaitement crédible à l'écran, pendant que l'offre restait à zéro.
+  //
+  // PAS DE REPLI EN SAISIE LIBRE si les listes ne chargent pas. Un repli rouvrirait
+  // précisément le champ que le serveur va refuser, et ferait passer une panne de
+  // chargement pour une faute de frappe du vendeur.
+  //
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // DEUX SOURCES, PARCE QUE LE SERVEUR EN ACCEPTE DEUX.
+  //
+  // La version précédente ne listait que les SKU des OFFRES, sous un commentaire qui
+  // affirmait que « la liste des SKU vendables est exactement GET /seller/offers ».
+  // C'est faux, et la conséquence n'était pas cosmétique : `CreateItemAsync`
+  // (SellerInventoryEndpoints) accepte une offre du vendeur sur ce SKU **OU** une
+  // déclinaison d'un de ses propres produits — la seconde voie existant précisément
+  // pour l'ordre naturel « je reçois la marchandise, ensuite je la mets en vente ».
+  //
+  // Un vendeur ayant des fiches mais aucune offre voyait donc une liste vide, un
+  // sélecteur DÉSACTIVÉ, et un message lui ordonnant de créer d'abord une offre —
+  // alors que le serveur aurait accepté sa déclinaison. La console fermait un parcours
+  // que le serveur avait été écrit pour garder ouvert, et rien à l'écran ne permettait
+  // de le deviner.
+  //
+  // Les deux mêmes clés que partout ailleurs (`["seller-offers"]`, `["seller-products"]`,
+  // sur les mêmes routes) : une clé dédiée aurait fabriqué un second cache de la même
+  // ressource, qu'aucune invalidation ne relie.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const offers = useQuery({
+    queryKey: ["seller-offers"],
+    queryFn: () => bff<SellerOffer[]>("/seller/offers"),
+    enabled: open,
+  });
+  const products = useQuery({
+    queryKey: ["seller-products"],
+    queryFn: () => bff<SellerProduct[]>("/seller/products"),
+    enabled: open,
+  });
+
+  /**
+   * Les SKU que le serveur acceptera, et eux seuls.
+   *
+   * Les offres d'abord : un SKU déjà en vente est celui que le vendeur reconnaîtra le
+   * plus vite, et `productName` y est déjà. Les déclinaisons ensuite, sans écraser une
+   * entrée existante — un même SKU porté par une offre ET par sa variante ne doit
+   * apparaître qu'une fois.
+   *
+   * La comparaison du serveur est INSENSIBLE À LA CASSE et il normalise en majuscules
+   * (`SkuPattern` = ^[A-Z0-9_-]{1,64}$). On normalise donc ici aussi, sinon « tsh-01 »
+   * venu d'une variante et « TSH-01 » venu d'une offre feraient deux lignes pour une
+   * seule référence.
+   */
+  const skuChoices = useMemo(() => {
+    const vus = new Map<string, { produit: string; enVente: boolean }>();
+
+    for (const o of offers.data ?? []) {
+      if (!o.sku) continue;
+      const cle = o.sku.trim().toUpperCase();
+      if (cle && !vus.has(cle)) vus.set(cle, { produit: o.productName, enVente: true });
+    }
+
+    for (const p of products.data ?? []) {
+      for (const v of p.variants ?? []) {
+        if (!v.sku) continue;
+        const cle = v.sku.trim().toUpperCase();
+        if (cle && !vus.has(cle)) vus.set(cle, { produit: p.name, enVente: false });
+      }
+    }
+
+    return Array.from(vus.entries())
+      .map(([valeur, info]) => ({ valeur, ...info }))
+      .sort((a, b) => a.valeur.localeCompare(b.valeur));
+  }, [offers.data, products.data]);
+
+  /** Une seule panne suffit à rendre la liste incomplète : on ne devine pas laquelle. */
+  const sourcesEnCours = offers.isLoading || products.isLoading;
+  const sourcesEnEchec = offers.isError || products.isError;
+
+  // Une seule référence suivable, ou un seul entrepôt : on les pose.
+  useAutoChoisirUnique(sku, setSku, skuChoices.map((c) => c.valeur));
+  useAutoChoisirUnique(locationId, setLocationId, locations.map((l) => l.id));
 
   const toInt = (v: string) => {
     const n = Number.parseInt(v.replace(/\D/g, ""), 10);
@@ -542,16 +853,47 @@ function CreateItemDialog({
       <div className="space-y-3">
         <div className="space-y-1.5">
           <Label htmlFor="sku">SKU</Label>
-          <Input
+          <select
             id="sku"
             value={sku}
             onChange={(e) => setSku(e.target.value)}
-            placeholder="La référence exacte de votre variante"
-            autoFocus
-          />
-          <p className="text-xs text-muted-foreground">
-            Doit correspondre au SKU d&apos;une variante de votre catalogue, à la lettre près.
-          </p>
+            disabled={sourcesEnCours || sourcesEnEchec || skuChoices.length === 0}
+            className="flex h-9 w-full rounded-md border border-input bg-background px-3 text-sm disabled:opacity-60"
+            // `autoFocus` est inutile ici : les requêtes sont `enabled: open`, donc le
+            // champ est TOUJOURS désactivé au montage et le focus retombe sur le
+            // document sans jamais revenir. On le donne quand le champ devient
+            // utilisable, ce qui est le moment où il sert.
+            ref={(el) => {
+              if (el && !el.disabled && document.activeElement === document.body) el.focus();
+            }}
+          >
+            <option value="">— Choisir —</option>
+            {skuChoices.map((c) => (
+              <option key={c.valeur} value={c.valeur}>
+                {c.valeur} — {c.produit}
+                {c.enVente ? "" : " (pas encore en vente)"}
+              </option>
+            ))}
+          </select>
+          {sourcesEnCours ? (
+            <p className="text-xs text-muted-foreground">Chargement de vos références…</p>
+          ) : sourcesEnEchec ? (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              Vos références n&apos;ont pas pu être chargées entièrement : impossible de savoir
+              lesquelles vous pouvez suivre. Réessayez dans un instant.
+            </p>
+          ) : skuChoices.length === 0 ? (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              Votre catalogue ne porte aucune référence. Le stock se déclare sur une déclinaison
+              d&apos;un de vos produits : créez d&apos;abord la fiche produit.
+            </p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Vos déclinaisons et vos mises en vente. Une référence pas encore en vente peut être
+              reçue en stock dès maintenant — l&apos;offre viendra après. Un même SKU peut être
+              suivi dans plusieurs entrepôts, une ligne par entrepôt.
+            </p>
+          )}
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="loc">Entrepôt</Label>

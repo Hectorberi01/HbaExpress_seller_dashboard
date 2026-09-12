@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
@@ -14,28 +14,56 @@ import { ArrowLeft, CheckCircle2, Eye, EyeOff, Loader2, Store } from "lucide-rea
 /**
  * Auto-inscription vendeur, en DEUX ÉTAPES.
  *
- * ─────────────────────────────────────────────────────────────────────────────────
- * L'ORDRE VIENT DU SERVEUR, PAS D'UN CHOIX D'ERGONOMIE
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * CET ÉCRAN PARLAIT UN CONTRAT QUI N'EXISTE PLUS, ET PERSONNE NE POUVAIT S'INSCRIRE.
  *
- * `POST /seller/auth/register` crée le compte (ou identifie l'existant) et envoie un
- * code. `POST /seller/auth/verify` valide ce code PUIS crée la boutique. Le nom de
- * boutique se saisit donc à l'étape 2, pas à l'étape 1 : l'onboarding vendeur exige un
- * e-mail vérifié, et demander le nom trop tôt donnerait l'illusion que la boutique
- * existe déjà.
+ * `POST /seller/auth/register` rendait autrefois `{ userId, isNewAccount }`. L'écran
+ * enchaînait dessus. Le serveur a fermé son oracle d'énumération en septembre 2026 : la
+ * réponse de SUCCÈS est désormais constante — `{ registered, message,
+ * requiresVerification }` — et ne dit plus rien du sort réel de la demande, qu'un compte
+ * ait été créé, qu'il existât déjà ou qu'aucun e-mail n'ait été envoyé. Le commentaire du
+ * serveur est explicite : « `IsNewAccount` a disparu avec `UserId` : c'était le même aveu
+ * sous un autre nom. »
  *
- * DEUX CAS, UN SEUL PARCOURS
+ * Les refus qui ne révèlent RIEN sur l'existence d'un compte, eux, sont toujours relayés
+ * tels quels — mot de passe trop court, adresse mal formée (`SellerRegistrationEndpoints`
+ * ne muselle que les conflits de compte existant). D'où le test sur le statut : il y a
+ * bien des erreurs à afficher, simplement plus aucune qui trahisse un compte.
  *
- * Un acheteur qui se lance a déjà un compte : le serveur ne le recrée pas, il lui envoie
- * un code pour prouver qu'il relève bien cette boîte avant de lui rattacher une
- * boutique. `isNewAccount` distingue les deux, et c'est la seule chose qui change à
- * l'écran — le mot de passe saisi est alors ignoré, autant le dire.
+ * L'écran, lui, testait `if (!res.ok || !data.userId)`. Il basculait donc TOUJOURS dans
+ * sa branche d'erreur, et comme le corps ne porte ni `detail`, ni `error`, ni `title`,
+ * il affichait son repli : « Inscription impossible. » Pendant ce temps le compte était
+ * réellement créé et le code à six chiffres partait par e-mail. Le commerçant restait
+ * à l'étape 1, avec un compte ouvert et un code qu'aucun écran ne lui permettait de
+ * saisir — et en réessayant, il relisait la même phrase.
  *
- * ⚠️ L'ÉTAPE 2 N'EST PAS TRANSACTIONNELLE côté serveur : elle enchaîne vérification du
- * code, création de la boutique, attribution du rôle et activation. Un nom de boutique
- * déjà pris fait échouer la deuxième opération alors que le code est CONSOMMÉ. On garde
- * donc l'utilisateur sur cette étape avec son `userId`, pour qu'il retente un autre nom
- * sans repartir de zéro.
- * ─────────────────────────────────────────────────────────────────────────────────
+ * ───────────────────────────────────────────────────────────────────────────────────
+ * CE QUI CHANGE, ET CE QUI RESTE
+ *
+ * Plus rien ne transite entre les deux étapes que ce que l'utilisateur a lui-même
+ * saisi : l'ADRESSE. `/verify` la prend désormais à la place de l'identifiant, pour la
+ * même raison anti-énumération. Un succès de `/register` est donc simplement un 2xx,
+ * et le message affiché est celui du serveur — volontairement prudent, parce qu'il ne
+ * promet pas un envoi dont il ne peut pas parler sans trahir l'existence du compte.
+ *
+ * `isNewAccount` disparaît aussi de l'écran. On ne peut plus dire « cette adresse a
+ * déjà un compte » : c'est précisément ce que le serveur refuse de divulguer.
+ *
+ * L'ÉTAPE 2 N'EST TOUJOURS PAS TRANSACTIONNELLE côté serveur — elle enchaîne
+ * vérification du code, création de la boutique, attribution du rôle et activation. Un
+ * nom de boutique déjà pris fait échouer la deuxième opération alors que le code est
+ * CONSOMMÉ. On garde donc l'utilisateur sur cette étape, avec son adresse, pour qu'il
+ * retente un autre nom sans repartir de zéro.
+ *
+ * ───────────────────────────────────────────────────────────────────────────────────
+ * ON PEUT ENTRER DIRECTEMENT À L'ÉTAPE 2 : `/inscription?verifier=<adresse>`
+ *
+ * Un compte non vérifié qui tente de se connecter reçoit du serveur : « Saisissez le
+ * code reçu par e-mail, ou demandez-en un nouveau. » Cette instruction n'était
+ * exécutable nulle part — le seul champ de saisie du code vivait derrière un
+ * `setStep("verify")` que plus rien ne déclenchait. L'écran de connexion pointe
+ * désormais ici, et cette entrée est ce qui rend le message du serveur vrai.
+ * ═══════════════════════════════════════════════════════════════════════════════════
  */
 export default function SellerRegisterPage() {
   const router = useRouter();
@@ -58,10 +86,45 @@ export default function SellerRegisterPage() {
     confirm: "",
   });
 
-  const [userId, setUserId] = useState<string | null>(null);
-  const [isNewAccount, setIsNewAccount] = useState(true);
   const [code, setCode] = useState("");
   const [shopName, setShopName] = useState("");
+  /** Message du serveur après `/register` ou un renvoi : on l'affiche tel quel. */
+  const [avis, setAvis] = useState<string | null>(null);
+  /** Secondes restantes avant qu'un nouveau renvoi soit permis. 0 = permis. */
+  const [attente, setAttente] = useState(0);
+  /**
+   * Vrai quand on est arrivé directement à l'étape 2 par `?verifier=`.
+   *
+   * C'est le seul cas où l'adresse doit rester modifiable : elle vient de l'URL et non
+   * d'une saisie qu'on vient de faire. Dans le parcours normal, la changer ici ferait
+   * vérifier le code contre une adresse à laquelle il n'a pas été envoyé.
+   */
+  const [entreeDirecte, setEntreeDirecte] = useState(false);
+
+  // ───────────────────────────────────────────────────────────────────────────────
+  // ENTRÉE DIRECTE À L'ÉTAPE 2 DEPUIS LA CONNEXION.
+  //
+  // `window.location.search` plutôt que `useSearchParams()` : ce dernier force la page
+  // en rendu dynamique ou exige une frontière Suspense, pour lire une valeur dont on
+  // n'a besoin qu'au montage. L'écran de connexion lit déjà son `?redirect=` de cette
+  // façon — autant garder un seul procédé dans le dépôt.
+  // ───────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const aVerifier = new URLSearchParams(window.location.search).get("verifier");
+    if (!aVerifier) return;
+    setForm((f) => ({ ...f, email: aVerifier }));
+    setEntreeDirecte(true);
+    setStep("verify");
+  }, []);
+
+  // Décompte du délai de renvoi. Le serveur impose une minute entre deux envois et
+  // rend `retryAfterSeconds` constant précisément pour qu'on puisse désactiver le
+  // bouton — ce qui supprime le geste dans le vide au lieu de l'expliquer après coup.
+  useEffect(() => {
+    if (attente <= 0) return;
+    const t = setTimeout(() => setAttente((n) => n - 1), 1000);
+    return () => clearTimeout(t);
+  }, [attente]);
 
   const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm((f) => ({ ...f, [k]: e.target.value }));
@@ -105,20 +168,27 @@ export default function SellerRegisterPage() {
         }),
       });
       const data = (await res.json().catch(() => ({}))) as {
-        userId?: string;
-        isNewAccount?: boolean;
+        message?: string;
         detail?: string;
         title?: string;
         error?: string;
       };
 
-      if (!res.ok || !data.userId) {
+      // ON NE TESTE PLUS QUE LE STATUT. La réponse de succès est constante et ne porte
+      // aucun identifiant : exiger un `userId` faisait basculer CHAQUE inscription
+      // réussie dans la branche d'erreur. Voir l'en-tête de ce fichier.
+      if (!res.ok) {
         setError(data.detail ?? data.error ?? data.title ?? "Inscription impossible.");
         return;
       }
 
-      setUserId(data.userId);
-      setIsNewAccount(data.isNewAccount !== false);
+      // Le message du serveur, tel quel. Il est volontairement prudent — « si cette
+      // adresse peut ouvrir une boutique, un code vient d'être envoyé » — parce qu'il
+      // ne peut pas affirmer un envoi sans révéler l'existence du compte. Le réécrire
+      // en « un code vient d'être envoyé » serait reprendre d'une main ce que le
+      // serveur protège de l'autre, et mentir une fois sur trois.
+      setAvis(data.message ?? null);
+      setAttente(60);
       setStep("verify");
     } catch {
       setError("Erreur réseau. Réessayez.");
@@ -145,7 +215,12 @@ export default function SellerRegisterPage() {
       const res = await fetch("/api/auth/verify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId, code: code.trim(), shopName: shopName.trim(), company: null }),
+        body: JSON.stringify({
+          email: form.email.trim(),
+          code: code.trim(),
+          shopName: shopName.trim(),
+          company: null,
+        }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         sellerId?: string;
@@ -166,6 +241,19 @@ export default function SellerRegisterPage() {
     }
   }
 
+  /**
+   * Renvoi du code.
+   *
+   * CETTE FONCTION NE FAISAIT LITTÉRALEMENT RIEN. Elle lisait un `userId` que le
+   * serveur ne rend plus, et n'avait aucune autre branche : pas de message, pas d'état
+   * modifié. Le vendeur cliquait, le spinner passait, l'écran était identique — alors
+   * il recliquait, et tombait sur le délai d'une minute côté serveur, toujours sans
+   * rien voir.
+   *
+   * Le serveur fournit `retryAfterSeconds`, CONSTANT, exactement pour ça : il ne
+   * dépend ni de l'existence du compte ni de l'état du délai, donc il ne divulgue
+   * rien, et il suffit à désactiver le bouton pendant une minute.
+   */
   async function resendCode() {
     setError(null);
     setLoading(true);
@@ -175,12 +263,19 @@ export default function SellerRegisterPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: form.email.trim() }),
       });
-      const data = (await res.json().catch(() => ({}))) as { userId?: string | null };
-      // On rafraîchit l'identifiant au passage : si le premier appel s'est perdu, c'est
-      // ici qu'on le récupère. Message identique dans tous les cas — voir la note de
-      // la route /api/auth/resend-code sur l'oracle d'existence de comptes.
-      if (data.userId) setUserId(data.userId);
-      setError(null);
+      const data = (await res.json().catch(() => ({}))) as {
+        message?: string;
+        retryAfterSeconds?: number;
+        error?: string;
+      };
+
+      if (!res.ok) {
+        setError(data.error ?? "Renvoi impossible. Réessayez dans un instant.");
+        return;
+      }
+
+      setAvis(data.message ?? "Si un compte existe pour cette adresse et n'est pas encore vérifié, un code vient de lui être envoyé.");
+      setAttente(typeof data.retryAfterSeconds === "number" ? data.retryAfterSeconds : 60);
     } catch {
       setError("Erreur réseau. Réessayez.");
     } finally {
@@ -318,18 +413,60 @@ export default function SellerRegisterPage() {
         ) : (
           <CardContent>
             <form onSubmit={submitVerify} className="space-y-4">
+              {/* ─────────────────────────────────────────────────────────────────
+                  LE MESSAGE VIENT DU SERVEUR, ET ON NE LE RÉÉCRIT PAS.
+
+                  L'écran affirmait « un code vient d'être envoyé ». Le serveur, lui,
+                  n'envoie rien dans trois cas — compte suspendu, adresse déjà
+                  rattachée à une boutique, numéro déjà pris — et sa formulation est
+                  prudente pour cette raison : « SI cette adresse peut ouvrir une
+                  boutique… ». Affirmer l'envoi, c'était reprendre d'une main ce que
+                  le serveur protège de l'autre, et se tromper une fois sur trois.
+
+                  On ne dit plus non plus si l'adresse avait déjà un compte : c'est
+                  précisément ce que le serveur refuse désormais de divulguer.
+                  ───────────────────────────────────────────────────────────────── */}
               <p className="rounded-lg bg-muted/50 p-3 text-sm text-muted-foreground">
-                Un code à six chiffres vient d&apos;être envoyé à{" "}
-                <strong>{form.email.trim()}</strong>. Vérifiez votre boîte, et les indésirables.
-                {!isNewAccount && (
+                {avis ?? (
                   <>
-                    {" "}
-                    Cette adresse a déjà un compte : <strong>il ne sera pas dupliqué</strong> et
-                    votre mot de passe actuel reste inchangé — celui saisi à l&apos;écran précédent
-                    est ignoré.
+                    Saisissez le code à six chiffres reçu par e-mail à l&apos;adresse{" "}
+                    <strong>{form.email.trim()}</strong>. Pensez à regarder vos courriers
+                    indésirables.
                   </>
                 )}
               </p>
+
+              {/* ─────────────────────────────────────────────────────────────────
+                  MODIFIABLE UNIQUEMENT À L'ENTRÉE DIRECTE, ET CETTE FOIS C'EST VRAI.
+
+                  La version précédente de ce commentaire annonçait cette restriction
+                  sans la poser : le champ n'avait ni `disabled` ni condition. Dans le
+                  parcours normal, l'adresse vient de l'étape 1 et le code a été envoyé
+                  À ELLE ; la corriger ici fait valider le code contre une autre adresse
+                  (`VerifyEmailCodeCommand(Email, Code)`), donc échouer alors que le code
+                  est bon — et l'utilisateur n'a aucun moyen de comprendre pourquoi.
+
+                  À l'entrée directe depuis la connexion, en revanche, l'adresse vient de
+                  l'URL : il faut pouvoir la corriger si elle est fausse.
+                  ───────────────────────────────────────────────────────────────── */}
+              <div className="space-y-1.5">
+                <Label htmlFor="verifyEmail">Adresse e-mail</Label>
+                <Input
+                  id="verifyEmail"
+                  type="email"
+                  required
+                  value={form.email}
+                  onChange={set("email")}
+                  disabled={!entreeDirecte}
+                  placeholder="vous@exemple.com"
+                />
+                {!entreeDirecte && (
+                  <p className="text-xs text-muted-foreground">
+                    Le code a été envoyé à cette adresse. Pour en utiliser une autre, revenez à
+                    l&apos;étape précédente.
+                  </p>
+                )}
+              </div>
 
               <div className="space-y-1.5">
                 <Label htmlFor="code">Code reçu par e-mail</Label>
@@ -373,6 +510,7 @@ export default function SellerRegisterPage() {
                   onClick={() => {
                     setStep("account");
                     setError(null);
+                    setAvis(null);
                   }}
                   className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
                 >
@@ -381,10 +519,10 @@ export default function SellerRegisterPage() {
                 <button
                   type="button"
                   onClick={resendCode}
-                  disabled={loading}
+                  disabled={loading || attente > 0}
                   className="text-primary hover:underline disabled:opacity-50"
                 >
-                  Renvoyer le code
+                  {attente > 0 ? `Renvoyer le code (${attente} s)` : "Renvoyer le code"}
                 </button>
               </div>
             </form>

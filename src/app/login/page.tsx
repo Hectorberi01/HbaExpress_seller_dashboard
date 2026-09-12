@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { apiLogin } from "@/lib/api";
+import { ApiError, apiLogin } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,11 +18,32 @@ export default function LoginPage() {
   const [mfaRequired, setMfaRequired] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Vrai quand le refus est « adresse non confirmée ».
+   *
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * LE SERVEUR DONNAIT UNE INSTRUCTION QUE L'APPLICATION NE PERMETTAIT PAS DE SUIVRE.
+   *
+   * Son message est : « Votre adresse e-mail n'est pas encore confirmée. Saisissez le
+   * code reçu par e-mail, ou demandez-en un nouveau. » Or il n'existait AUCUN écran
+   * atteignable pour saisir ce code : le seul champ vivait à l'étape 2 de
+   * l'inscription, derrière un `setStep("verify")` que plus rien ne déclenchait.
+   * L'écran de mot de passe oublié traite un autre code, celui de réinitialisation.
+   *
+   * Le compte était donc enfermé dehors : ni connexion, ni chemin pour se vérifier.
+   *
+   * ON BRANCHE SUR LE CODE, PAS SUR LA PHRASE. « Compte suspendu » et « adresse non
+   * confirmée » sortent tous deux en 403 : le statut ne les distingue pas, et
+   * reconnaître un message français serait se lier à une formulation qui changera.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const [aVerifier, setAVerifier] = useState(false);
   const [loading, setLoading] = useState(false);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setAVerifier(false);
     setLoading(true);
     try {
       const res = await apiLogin(email, password, mfaRequired ? mfaCode : undefined);
@@ -46,6 +67,7 @@ export default function LoginPage() {
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Connexion impossible.");
+      setAVerifier(err instanceof ApiError && err.code === "identity.auth.email_not_verified");
     } finally {
       setLoading(false);
     }
@@ -114,6 +136,19 @@ export default function LoginPage() {
               </div>
             )}
             {error && <p className="text-sm text-destructive">{error}</p>}
+
+            {/* L'instruction du serveur devient exécutable : ce lien mène à l'étape de
+                saisie du code, avec l'adresse déjà remplie. Sans lui, le message
+                « saisissez le code reçu par e-mail » désignait un écran qui n'existait
+                nulle part, et le compte restait enfermé dehors. */}
+            {aVerifier && (
+              <Link
+                href={`/inscription?verifier=${encodeURIComponent(email.trim())}`}
+                className="block rounded-lg border border-primary/30 bg-primary/5 p-3 text-center text-sm font-medium text-primary hover:bg-primary/10"
+              >
+                Saisir mon code de vérification
+              </Link>
+            )}
             <Button type="submit" className="w-full" disabled={loading}>
               {loading && <Loader2 className="size-4 animate-spin" />}
               {mfaRequired ? "Valider le code" : "Se connecter"}

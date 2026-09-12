@@ -3,11 +3,13 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
-import { formatDateTime, formatXof } from "@/lib/utils";
+import { useAutoChoisirUnique } from "@/lib/auto-choice";
+import { decimalesDeDevise, formatDateTime, formatMoney } from "@/lib/utils";
 import { catalogTone, statusLabel } from "@/lib/status-labels";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ReadOnlyNote } from "@/components/read-only-note";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -30,6 +32,37 @@ const normalizeNumeric = (s: string) => s.replace(/\s/g, "").replace(",", ".");
 
 /** Entier positif ou nul — pour les montants XOF, qui n'ont pas de centimes. */
 const isWholeNumber = (s: string) => /^\d+$/.test(normalizeNumeric(s));
+
+/**
+ * ═════════════════════════════════════════════════════════════════════════════════
+ * MONTANT VALIDE DANS LA DEVISE DE L'OFFRE — ET PAS « ENTIER », PARTOUT.
+ *
+ * `isWholeNumber` seul rendait une offre non-XOF intarifiable : 12,40 € préremplissait
+ * « 12.4 », le test échouait, et l'écran répondait « un montant entier strictement
+ * positif est attendu » — pendant que l'étiquette du champ, juste au-dessus, lisait
+ * déjà « (EUR) ». Le domaine, lui, accepte les décimales d'une devise qui en a.
+ *
+ * On borne au nombre de décimales de la devise plutôt que d'ouvrir aux décimales tout
+ * court : « 100,5 » francs CFA n'existe pas, et l'accepter ici ne ferait que déplacer
+ * le refus au serveur.
+ * ═════════════════════════════════════════════════════════════════════════════════
+ */
+function montantValideEnDevise(saisie: string, currency: string | null | undefined): boolean {
+  const brut = normalizeNumeric(saisie);
+  const decimales = decimalesDeDevise(currency);
+  const motif = decimales === 0 ? /^\d+$/ : new RegExp(`^\\d+(\\.\\d{1,${decimales}})?$`);
+  return motif.test(brut);
+}
+
+/** Le rappel de format, formulé pour la devise réellement en jeu. */
+function attenduEnDevise(currency: string | null | undefined): string {
+  const decimales = decimalesDeDevise(currency);
+  return decimales === 0
+    ? "Un montant entier strictement positif est attendu, sans espace ni décimale."
+    // `normalizeNumeric` convertit déjà la virgule en point : interdire la virgule
+    // dans le message reviendrait à refuser par écrit ce que le champ accepte.
+    : `Un montant strictement positif est attendu, avec au plus ${decimales} décimale${decimales > 1 ? "s" : ""}.`;
+}
 
 /** Nombre positif, décimales admises — pour un pourcentage (le domaine prend un `decimal`). */
 const isDecimalNumber = (s: string) => /^\d+(\.\d+)?$/.test(normalizeNumeric(s));
@@ -122,6 +155,7 @@ export function ProductOffersManager({
   offersLoading,
   offersUnavailable,
   onChanged,
+  lectureSeule = false,
 }: {
   product: SellerProduct;
   offers: SellerOffer[];
@@ -138,6 +172,13 @@ export function ProductOffersManager({
   /** Vrai si la requête des offres a ÉCHOUÉ — à distinguer de « aucune offre ». */
   offersUnavailable: boolean;
   onChanged: () => Promise<unknown>;
+  /**
+   * La boutique n'a plus le droit d'écrire. TOUTES les routes d'offre sont gardées :
+   * `SellerOfferEndpoints.GuardAsync` pour les modifications, et
+   * `CreateOfferCommandHandler` pour la création — qui fut longtemps le seul contrôle
+   * de statut du dépôt.
+   */
+  lectureSeule?: boolean;
 }) {
   const [creating, setCreating] = useState(false);
   const [formKey, setFormKey] = useState(0);
@@ -168,13 +209,14 @@ export function ProductOffersManager({
             setFormKey((k) => k + 1);
             setCreating(true);
           }}
-          disabled={uncertain}
+          disabled={uncertain || lectureSeule}
         >
           <Plus className="size-4" /> Mettre en vente
         </Button>
       </CardHeader>
 
       <CardContent className="space-y-4 pt-0">
+        {lectureSeule && <ReadOnlyNote />}
         {offersLoading ? (
           <p className="text-sm text-muted-foreground">Chargement des mises en vente…</p>
         ) : offersUnavailable ? (
@@ -190,7 +232,9 @@ export function ProductOffersManager({
             de l&apos;article et l&apos;entrepôt d&apos;expédition.
           </p>
         ) : (
-          offers.map((o) => <OfferBlock key={o.id} offer={o} onChanged={onChanged} />)
+          offers.map((o) => (
+            <OfferBlock key={o.id} offer={o} onChanged={onChanged} lectureSeule={lectureSeule} />
+          ))
         )}
       </CardContent>
 
@@ -208,7 +252,15 @@ export function ProductOffersManager({
 }
 
 /** Une mise en vente : décomposition du prix + actions. */
-function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () => Promise<unknown> }) {
+function OfferBlock({
+  offer,
+  onChanged,
+  lectureSeule,
+}: {
+  offer: SellerOffer;
+  onChanged: () => Promise<unknown>;
+  lectureSeule: boolean;
+}) {
   const [pane, setPane] = useState<"none" | "price" | "handling" | "discount">("none");
   const [price, setPrice] = useState(String(offer.sellerPrice));
   const [handling, setHandling] = useState(String(offer.handlingTime));
@@ -329,7 +381,11 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
   // On teste donc sur le RÉSULTAT calculé, pas sur la saisie.
   // ───────────────────────────────────────────────────────────────────────────────
   const discountSyntaxOk =
-    discountType === "Percentage" ? isDecimalNumber(discountValue) : isWholeNumber(discountValue);
+    discountType === "Percentage"
+      ? isDecimalNumber(discountValue)
+      // Une remise en montant est un MONTANT : elle suit la devise de l'offre, comme
+      // le prix. L'exiger entière rendait toute remise non-XOF impossible à saisir.
+      : montantValideEnDevise(discountValue, offer.currency);
 
   // ⚠️ L'aperçu n'est calculé que si AUCUNE remise n'est en cours : sinon le domaine
   // repart du prix d'origine (`OriginalSellerPrice`), que l'API ne renvoie pas.
@@ -351,7 +407,7 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
 
   const discountSubmittable = discountInRange && discountEndsValid;
 
-  const priceValid = isWholeNumber(price) && toNumber(price) > 0;
+  const priceValid = montantValideEnDevise(price, offer.currency) && toNumber(price) > 0;
   const handlingValid = isWholeNumber(handling);
 
   return (
@@ -360,7 +416,15 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
         <span className="font-mono text-xs font-medium">{offer.sku}</span>
         <div className="flex flex-wrap items-center gap-1.5">
           <Badge variant="neutral">{statusLabel(offer.condition, "offerCondition")}</Badge>
-          <Badge variant="neutral">{statusLabel(offer.fulfillmentType, "fulfillmentType")}</Badge>
+          {/* Le badge n'apparaît plus que sur une offre créée avant le retrait du
+              choix : il dit alors que la mention est sans effet, plutôt que de
+              répéter « Vous expédiez » sur chaque ligne — ce qui est désormais vrai
+              de toutes. */}
+          {(offer.fulfillmentType ?? "").toLowerCase() !== "fbs" && (
+            <Badge variant="warning" title="Cette mention n'a aucun effet : vous restez l'expéditeur.">
+              {statusLabel(offer.fulfillmentType, "fulfillmentType")} — sans effet
+            </Badge>
+          )}
           <Badge variant={catalogTone(offer.status)}>{statusLabel(offer.status, "offer")}</Badge>
         </div>
       </div>
@@ -371,23 +435,23 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
           <dd className="tabular-nums">
             {hasDiscount && (
               <span className="mr-1.5 text-muted-foreground line-through">
-                {formatXof(offer.compareAtAmount ?? 0)}
+                {formatMoney(offer.compareAtAmount ?? 0, offer.currency)}
               </span>
             )}
-            {formatXof(offer.productPrice)}
+            {formatMoney(offer.productPrice, offer.currency)}
           </dd>
         </div>
         <div className="flex justify-between text-muted-foreground">
           <dt>Commission plateforme</dt>
-          <dd className="tabular-nums">−{formatXof(offer.commissionAmount)}</dd>
+          <dd className="tabular-nums">−{formatMoney(offer.commissionAmount, offer.currency)}</dd>
         </div>
         <div className="flex justify-between text-muted-foreground">
           <dt>Frais du prestataire de paiement</dt>
-          <dd className="tabular-nums">−{formatXof(offer.providerFeeAmount)}</dd>
+          <dd className="tabular-nums">−{formatMoney(offer.providerFeeAmount, offer.currency)}</dd>
         </div>
         <div className="flex justify-between border-t border-border pt-1 font-semibold">
           <dt>Vous percevez</dt>
-          <dd className="tabular-nums text-primary">{formatXof(offer.sellerPrice)}</dd>
+          <dd className="tabular-nums text-primary">{formatMoney(offer.sellerPrice, offer.currency)}</dd>
         </div>
       </dl>
 
@@ -405,24 +469,39 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
       </p>
 
       <div className="mt-3 flex flex-wrap gap-2">
-        <Button size="sm" variant="outline" onClick={() => openPane("price")}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => openPane("price")}
+          disabled={lectureSeule}
+        >
           Modifier le prix
         </Button>
-        <Button size="sm" variant="outline" onClick={() => openPane("handling")}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => openPane("handling")}
+          disabled={lectureSeule}
+        >
           Délai de préparation
         </Button>
         {hasDiscount ? (
           <Button
             size="sm"
             variant="outline"
-            disabled={removeDiscount.isPending}
+            disabled={lectureSeule || removeDiscount.isPending}
             onClick={() => removeDiscount.mutate()}
           >
             {removeDiscount.isPending && <Loader2 className="size-4 animate-spin" />}
             Retirer la remise
           </Button>
         ) : (
-          <Button size="sm" variant="outline" onClick={() => openPane("discount")}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => openPane("discount")}
+            disabled={lectureSeule}
+          >
             <TrendingDown className="size-4" /> Appliquer une remise
           </Button>
         )}
@@ -431,7 +510,7 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
           <Button
             size="sm"
             variant="outline"
-            disabled={changeStatus.isPending}
+            disabled={lectureSeule || changeStatus.isPending}
             onClick={() => changeStatus.mutate("Paused")}
           >
             Suspendre la vente
@@ -440,7 +519,7 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
           <Button
             size="sm"
             variant="outline"
-            disabled={changeStatus.isPending}
+            disabled={lectureSeule || changeStatus.isPending}
             onClick={() => changeStatus.mutate("Active")}
           >
             Remettre en vente
@@ -452,6 +531,7 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
           variant="ghost"
           className="text-destructive"
           onClick={() => setConfirmDelete(true)}
+          disabled={lectureSeule}
         >
           <Trash2 className="size-4" /> Supprimer
         </Button>
@@ -479,14 +559,14 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
           <Label htmlFor={`price-${offer.id}`}>Ce que vous percevez ({offer.currency})</Label>
           <Input
             id={`price-${offer.id}`}
-            inputMode="numeric"
+            // `numeric` interdit le point décimal sur le clavier mobile : sur une
+            // devise à centimes, le champ devenait inutilisable au doigt.
+            inputMode={decimalesDeDevise(offer.currency) === 0 ? "numeric" : "decimal"}
             value={price}
             onChange={(e) => setPrice(e.target.value)}
           />
           {!priceValid && price.trim().length > 0 && (
-            <p className="text-xs text-destructive">
-              Un montant entier strictement positif est attendu, sans espace ni décimale.
-            </p>
+            <p className="text-xs text-destructive">{attenduEnDevise(offer.currency)}</p>
           )}
           {priceValid && (
             <PriceBreakdown
@@ -594,16 +674,16 @@ function OfferBlock({ offer, onChanged }: { offer: SellerOffer; onChanged: () =>
             <p className="text-xs text-destructive">
               {discountType === "Percentage"
                 ? "Un pourcentage strictement compris entre 0 et 100, et qui fasse réellement baisser le prix arrondi."
-                : `Un montant entier strictement inférieur à ${formatXof(offer.sellerPrice)} : la remise doit laisser un prix positif.`}
+                : `Un montant strictement inférieur à ${formatMoney(offer.sellerPrice, offer.currency)} : la remise doit laisser un prix positif.`}
             </p>
           )}
           {preview !== null && (
             <p className="text-xs text-muted-foreground">
               Vous percevriez{" "}
               <span className="font-medium tabular-nums text-foreground">
-                {formatXof(preview)}
+                {formatMoney(preview, offer.currency)}
               </span>{" "}
-              au lieu de {formatXof(offer.sellerPrice)}. Le prix acheteur est recalculé par la
+              au lieu de {formatMoney(offer.sellerPrice, offer.currency)}. Le prix acheteur est recalculé par la
               plateforme.
             </p>
           )}
@@ -685,7 +765,27 @@ function CreateOfferDialog({
   const [sku, setSku] = useState("");
   const [sellerPrice, setSellerPrice] = useState("");
   const [condition, setCondition] = useState("New");
-  const [fulfillmentType, setFulfillmentType] = useState("Fbs");
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * « LA PLATEFORME EXPÉDIE » NE CHANGEAIT STRICTEMENT RIEN, ET LE DISAIT.
+   *
+   * Le vendeur choisissait entre « Vous expédiez » et « La plateforme expédie », la
+   * valeur partait au serveur, et le badge la lui confirmait ensuite sur la fiche.
+   * `FulfillmentType` est stocké puis recopié, et lu par PERSONNE : hors du module
+   * Offers, ses seules occurrences dans tout le backend sont des passe-plats. Le
+   * module Shipping crée les expéditions par `(SellerId, ShipFromLocationId)` sans
+   * jamais consulter ce champ.
+   *
+   * Le vendeur croyait donc déléguer sa logistique, et continuait de recevoir toutes
+   * les expéditions à préparer — dans un écran qui, dans la même boîte, lui demandait
+   * quand même SON entrepôt et SON délai de préparation.
+   *
+   * L'ASSISTANT DE CRÉATION AVAIT DÉJÀ TRANCHÉ : il code `Fbs` en dur. On aligne cet
+   * écran sur lui plutôt que d'offrir un choix qui n'existe pas. Le jour où le FBP
+   * sera implémenté, c'est cette constante qui redeviendra un champ.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const fulfillmentType = "Fbs";
   const [locationId, setLocationId] = useState("");
   const [handlingTime, setHandlingTime] = useState("2");
   const pricing = usePricingRates();
@@ -731,7 +831,12 @@ function CreateOfferDialog({
     },
   });
 
-  const priceValid = isWholeNumber(sellerPrice) && toNumber(sellerPrice) > 0;
+  // Une seule déclinaison encore libre, ou un seul entrepôt : on les pose. C'est le
+  // cas de tout produit simple créé par l'assistant, qui n'en crée qu'une.
+  useAutoChoisirUnique(sku, setSku, freeSkus.map((v) => v.sku));
+  useAutoChoisirUnique(locationId, setLocationId, locations.map((l) => l.id));
+
+  const priceValid = montantValideEnDevise(sellerPrice, currency) && toNumber(sellerPrice) > 0;
   const handlingValid = isWholeNumber(handlingTime);
   const canCreate = sku.trim().length > 0 && priceValid && handlingValid && locationId.length > 0;
 
@@ -783,14 +888,12 @@ function CreateOfferDialog({
         <Label htmlFor="o-price">Ce que vous percevez ({currency})</Label>
         <Input
           id="o-price"
-          inputMode="numeric"
+          inputMode={decimalesDeDevise(currency) === 0 ? "numeric" : "decimal"}
           value={sellerPrice}
           onChange={(e) => setSellerPrice(e.target.value)}
         />
         {sellerPrice.trim().length > 0 && !priceValid && (
-          <p className="text-xs text-destructive">
-            Un montant entier strictement positif est attendu, sans espace ni décimale.
-          </p>
+          <p className="text-xs text-destructive">{attenduEnDevise(currency)}</p>
         )}
         {priceValid ? (
           <PriceBreakdown
@@ -816,24 +919,29 @@ function CreateOfferDialog({
           </Select>
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="o-fulfillment">Expédition</Label>
-          <Select
-            id="o-fulfillment"
-            value={fulfillmentType}
-            onChange={(e) => setFulfillmentType(e.target.value)}
-          >
-            <option value="Fbs">Vous expédiez</option>
-            <option value="Fbp">La plateforme expédie</option>
-          </Select>
+          <Label>Expédition</Label>
+          <div className="flex h-9 items-center rounded-xl bg-muted px-3.5 text-sm text-muted-foreground">
+            Vous expédiez
+          </div>
+          <p className="text-xs text-muted-foreground">
+            L&apos;expédition par la plateforme n&apos;est pas encore disponible.
+          </p>
         </div>
       </div>
 
       <div className="space-y-1.5">
         <Label htmlFor="o-location">Entrepôt d&apos;expédition</Label>
         {locations.length === 0 ? (
+          /* L'ENTREPÔT N'ESTIME AUCUN DÉLAI. Le délai annoncé à l'acheteur vient de la zone
+             de DESTINATION : `GetRatesForCommuneAsync(communeCode)` résout la commune de
+             l'acheteur, puis rend le `ShippingRate.Eta` de cette zone.
+
+             `ShipFromLocationId` n'est lu par le module Shipping que pour deux choses, dont
+             aucune n'est un délai : grouper les expéditions par (vendeur, entrepôt), et
+             donner au coursier l'adresse où il vient chercher le colis. */
           <p className="rounded-lg bg-amber-100 p-3 text-xs text-amber-800 dark:bg-amber-500/15 dark:text-amber-400">
-            Aucun entrepôt enregistré. Créez-en un depuis la page Stock : c&apos;est le point
-            de départ utilisé pour estimer les délais de livraison.
+            Aucun entrepôt enregistré. Créez-en un depuis la page Stock : c&apos;est
+            l&apos;adresse où le coursier vient chercher vos colis.
           </p>
         ) : (
           <Select id="o-location" value={locationId} onChange={(e) => setLocationId(e.target.value)}>

@@ -5,10 +5,11 @@ import { useMutation } from "@tanstack/react-query";
 import { bff } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ReadOnlyNote } from "@/components/read-only-note";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import type { ProductVariant, SellerProduct } from "@/types/seller";
+import type { ProductVariant, SellerOffer, SellerProduct } from "@/types/seller";
 import { Loader2, Pencil, Plus, Trash2, X } from "lucide-react";
 
 /** Ligne d'attribut avec identité propre — voir la même note dans `ProductIdentityForm`. */
@@ -25,9 +26,6 @@ type Draft = {
   sku: string;
   barcode: string;
   weightGrams: string;
-  lengthMm: string;
-  widthMm: string;
-  heightMm: string;
   attributes: AttributeRow[];
 };
 
@@ -35,30 +33,80 @@ const EMPTY: Draft = {
   sku: "",
   barcode: "",
   weightGrams: "0",
-  lengthMm: "",
-  widthMm: "",
-  heightMm: "",
   attributes: [],
 };
 
 /**
  * Déclinaisons (taille, couleur…).
  *
- * ⚠️ ASYMÉTRIE ENTRE CRÉATION ET MODIFICATION
+ * ═══════════════════════════════════════════════════════════════════════════════════
+ * L'ASYMÉTRIE CRÉATION / MODIFICATION A ÉTÉ RÉSOLUE EN RETIRANT LE CHAMP, PAS EN
+ * L'ÉTENDANT.
  *
- * `AddProductVariantCommand` accepte les dimensions (longueur, largeur, hauteur) ;
- * `UpdateProductVariantCommand` ne les prend pas, et `ProductVariantSummary` ne les
- * renvoie pas. Elles sont donc saisissables À LA CRÉATION SEULEMENT, et invisibles
- * ensuite. Les proposer à la modification aurait produit le pire des cas : un champ
- * qu'on remplit, qu'on enregistre, et dont la valeur part à la poubelle sans un mot.
+ * `AddProductVariantCommand` accepte les dimensions ; `UpdateProductVariantCommand` ne
+ * les prend pas, et `ProductVariantSummary` ne les renvoie pas. Le formulaire les
+ * proposait donc à la création seulement, avec un avertissement honnête (« plus
+ * modifiables ensuite »).
+ *
+ * La question qu'on ne s'était pas posée est celle de l'audit : QUI LES LIT ? Personne.
+ * Ni le transport — le tarif est un forfait par commune —, ni l'acheteur, ni l'admin,
+ * ni le vendeur lui-même, qui ne peut pas les relire. Étendre la modification aurait
+ * rendu modifiable une donnée morte ; on a retiré la demande.
+ *
+ * Le poids reste, parce qu'il revient au moins à l'écran (ici, sur l'app mobile et
+ * chez l'admin) — mais il n'entre lui non plus dans aucun calcul, et il est devenu
+ * facultatif à la création d'un produit.
+ * ═══════════════════════════════════════════════════════════════════════════════════
  */
 export function ProductVariantsManager({
   product,
   onChanged,
+  offresDuProduit,
+  offresIndisponibles,
+  lectureSeule = false,
 }: {
   product: SellerProduct;
   onChanged: () => Promise<unknown>;
+  /** Offres du vendeur sur CE produit — sert à savoir quels SKU sont engagés. */
+  offresDuProduit: SellerOffer[];
+  /** Vrai tant qu'on ne SAIT pas : chargement en cours, ou échec. */
+  offresIndisponibles: boolean;
+  /**
+   * La boutique n'a plus le droit d'écrire. Ajout, modification et retrait de
+   * déclinaison sont tous gardés côté serveur (l'ajout l'est depuis le même lot que
+   * ce correctif).
+   */
+  lectureSeule?: boolean;
 }) {
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════════
+   * LE SKU D'UNE DÉCLINAISON DÉJÀ MISE EN VENTE NE SE RENOMME PLUS.
+   *
+   * Ce champ était librement modifiable, sans un mot — alors que la boîte de
+   * SUPPRESSION, elle, porte un avertissement. L'asymétrie disait au vendeur que
+   * renommer était le geste sans conséquence des deux.
+   *
+   * C'est l'inverse. `Product.UpdateVariant` écrit le nouveau SKU et ne lève AUCUN
+   * événement : `Offer.VariantSku` et `InventoryItem.Sku` gardent l'ancien. Le
+   * sélecteur de création d'offre calcule les SKU libres en comparant variantes et
+   * offres — la variante renommée redevient « libre », le vendeur crée une seconde
+   * mise en vente dessus, sans stock derrière. Et `IsInStockAsync` répond
+   * « disponible » pour un SKU que personne ne suit. C'est une vente à découvert, sur
+   * une fiche qui affiche deux offres dont l'une est fantôme.
+   *
+   * Le serveur refuse désormais ce renommage (409). Ce verrou d'écran est ce qui évite
+   * de l'apprendre après avoir tout ressaisi.
+   *
+   * TANT QU'ON NE SAIT PAS, ON VERROUILLE. Si les offres sont en cours de chargement
+   * ou n'ont pas pu être lues, on ne peut pas affirmer que ce SKU est libre. Ouvrir le
+   * champ « par défaut » rendrait le verrou absent exactement les jours où le serveur
+   * est instable — et le vendeur recevrait un 409 sans rien comprendre.
+   * ═══════════════════════════════════════════════════════════════════════════════
+   */
+  const skusEngages = new Set(
+    offresDuProduit.map((o) => (o.sku ?? "").trim().toUpperCase()).filter((x) => x.length > 0),
+  );
+
   const [pane, setPane] = useState<"none" | "create" | "edit">("none");
   const [editing, setEditing] = useState<ProductVariant | null>(null);
   const [draft, setDraft] = useState<Draft>(EMPTY);
@@ -81,15 +129,12 @@ export function ProductVariantsManager({
       sku: v.sku,
       barcode: v.barcode ?? "",
       weightGrams: String(v.weightGrams ?? 0),
-      lengthMm: "",
-      widthMm: "",
-      heightMm: "",
       attributes: toRows(v.attributes),
     });
     setPane("edit");
   }
 
-  function payload(withDimensions: boolean) {
+  function payload() {
     // Champ vide ou non numérique → `null`, jamais `NaN`. `JSON.stringify(NaN)` émet
     // `null` de toute façon, mais sur un `int` NON nullable côté serveur cela produit
     // un 400 de désérialisation sans message métier — une erreur qu'on ne peut ni
@@ -100,11 +145,16 @@ export function ProductVariantsManager({
       attributes: Object.fromEntries(
         draft.attributes.filter((a) => a.key.trim().length > 0).map((a) => [a.key.trim(), a.value]),
       ),
+      // CODE-BARRES : PLUS DE CHAMP, MAIS LA VALEUR EXISTANTE EST RENVOYÉE.
+      // `openEdit` charge `v.barcode` dans le brouillon ; l'omettre ici effacerait le
+      // code-barres des déclinaisons qui en portent un, à la première modification de
+      // leur poids. Personne ne le lit — ce n'est pas une raison pour le détruire.
       barcode: draft.barcode.trim() || null,
       weightGrams: num(draft.weightGrams) ?? 0,
-      lengthMm: withDimensions ? num(draft.lengthMm) : null,
-      widthMm: withDimensions ? num(draft.widthMm) : null,
-      heightMm: withDimensions ? num(draft.heightMm) : null,
+      // Dimensions : voir la note du formulaire. Plus demandées, donc jamais posées.
+      lengthMm: null,
+      widthMm: null,
+      heightMm: null,
     };
   }
 
@@ -112,7 +162,7 @@ export function ProductVariantsManager({
     mutationFn: () =>
       bff<{ variantId: string }>(`/seller/products/${product.id}/variants`, {
         method: "POST",
-        body: JSON.stringify(payload(true)),
+        body: JSON.stringify(payload()),
       }),
     onSuccess: async () => {
       closePane();
@@ -125,7 +175,7 @@ export function ProductVariantsManager({
     mutationFn: () =>
       bff(`/seller/products/${product.id}/variants/${editing?.id}`, {
         method: "PUT",
-        body: JSON.stringify(payload(false)),
+        body: JSON.stringify(payload()),
       }),
     onSuccess: async () => {
       closePane();
@@ -147,27 +197,44 @@ export function ProductVariantsManager({
   const isCreate = pane === "create";
   const saving = create.isPending || update.isPending;
   // ───────────────────────────────────────────────────────────────────────────────
-  // LE POIDS EST OBLIGATOIRE.
+  // LE POIDS EST OBLIGATOIRE ICI, ET LA RAISON N'EST PAS CELLE QUI ÉTAIT ÉCRITE.
   //
-  // Il part vers un `int` non nullable : « 1,5 » ou « abc » ferait échouer la
-  // désérialisation avant toute validation métier. Mais surtout, un champ VIDE était
-  // converti en `0` sans un mot — la déclinaison était enregistrée à 0 g, et c'est
-  // cette donnée qui sert aux calculs d'expédition. Un poids nul ne se distingue pas
-  // d'un poids oublié : on exige donc une saisie.
+  // Le commentaire précédent disait « c'est cette donnée qui sert aux calculs
+  // d'expédition ». FAUX, et contredit par la note du formulaire plus bas :
+  // `ShippingRate` est un forfait par commune de destination, qui « ne dépend ni du
+  // poids, ni du volume, ni du nombre d'articles ». Aucun calcul ne lit le poids.
+  //
+  // Ce qui reste vrai, et qui suffit à exiger une saisie : le champ part vers un `int`
+  // NON NULLABLE. « 1,5 » ou « abc » fait échouer la désérialisation avant toute
+  // validation métier, avec un 400 que l'écran ne sait pas expliquer. On demande donc
+  // un entier — 0 compris, et le message d'erreur le dit.
+  //
+  // La création d'un produit, elle, n'exige plus rien : l'assistant envoie 0 et laisse
+  // le vendeur préciser ici s'il en a l'usage.
   // ───────────────────────────────────────────────────────────────────────────────
   const weightOk = isWholeNumber(draft.weightGrams);
+
+  // Verrou du SKU : jamais à la création (rien n'est encore engagé), toujours à la
+  // modification tant qu'on ignore l'état des offres, et sinon dès qu'une offre porte
+  // la référence ACTUELLE — pas celle en cours de saisie, qui est justement ce qu'on
+  // empêche de changer.
+  const skuVerrouille =
+    !isCreate &&
+    (offresIndisponibles || skusEngages.has((editing?.sku ?? "").trim().toUpperCase()));
+
   const canSave = draft.sku.trim().length > 0 && weightOk;
 
   return (
     <Card>
       <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
         <CardTitle>Déclinaisons ({product.variants.length})</CardTitle>
-        <Button size="sm" variant="outline" onClick={openCreate}>
+        <Button size="sm" variant="outline" onClick={openCreate} disabled={lectureSeule}>
           <Plus className="size-4" /> Ajouter
         </Button>
       </CardHeader>
 
       <CardContent className="space-y-2 pt-0">
+        {lectureSeule && <ReadOnlyNote />}
         {product.variants.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             Aucune déclinaison. Le SKU d&apos;une déclinaison est la référence que vous
@@ -190,7 +257,13 @@ export function ProductVariantsManager({
                 </div>
               </div>
               <div className="flex gap-1">
-                <Button size="icon" variant="ghost" aria-label="Modifier" onClick={() => openEdit(v)}>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  aria-label="Modifier"
+                  onClick={() => openEdit(v)}
+                  disabled={lectureSeule}
+                >
                   <Pencil className="size-4" />
                 </Button>
                 <Button
@@ -199,6 +272,7 @@ export function ProductVariantsManager({
                   className="text-destructive"
                   aria-label="Retirer"
                   onClick={() => setConfirmDelete(v)}
+                  disabled={lectureSeule}
                 >
                   <Trash2 className="size-4" />
                 </Button>
@@ -238,7 +312,20 @@ export function ProductVariantsManager({
             value={draft.sku}
             onChange={(e) => setDraft((d) => ({ ...d, sku: e.target.value }))}
             placeholder="Ex. TSHIRT-BLEU-M"
+            disabled={skuVerrouille}
+            aria-describedby={skuVerrouille || !isCreate ? "v-sku-note" : undefined}
           />
+          {skuVerrouille ? (
+            <p id="v-sku-note" className="text-xs text-amber-700 dark:text-amber-400">
+              {offresIndisponibles
+                ? "Vos mises en vente n'ont pas pu être lues : tant qu'on ignore si ce SKU est engagé, il n'est pas modifiable. Rechargez la page."
+                : "Cette référence porte une de vos mises en vente. La renommer laisserait l'offre et le stock sur l'ancienne : retirez l'offre, renommez, puis recréez-la — ou ajoutez une nouvelle déclinaison."}
+            </p>
+          ) : !isCreate ? (
+            <p id="v-sku-note" className="text-xs text-muted-foreground">
+              Modifiable tant qu&apos;aucune mise en vente ne porte cette référence.
+            </p>
+          ) : null}
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2">
@@ -256,49 +343,30 @@ export function ProductVariantsManager({
               </p>
             )}
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="v-barcode">Code-barres</Label>
-            <Input
-              id="v-barcode"
-              value={draft.barcode}
-              onChange={(e) => setDraft((d) => ({ ...d, barcode: e.target.value }))}
-              placeholder="Facultatif"
-            />
-          </div>
         </div>
 
-        {isCreate && (
-          <div className="space-y-1.5">
-            <Label>Dimensions du colis (mm)</Label>
-            <div className="grid grid-cols-3 gap-2">
-              <Input
-                inputMode="numeric"
-                aria-label="Longueur en millimètres"
-                placeholder="Long."
-                value={draft.lengthMm}
-                onChange={(e) => setDraft((d) => ({ ...d, lengthMm: e.target.value }))}
-              />
-              <Input
-                inputMode="numeric"
-                aria-label="Largeur en millimètres"
-                placeholder="Larg."
-                value={draft.widthMm}
-                onChange={(e) => setDraft((d) => ({ ...d, widthMm: e.target.value }))}
-              />
-              <Input
-                inputMode="numeric"
-                aria-label="Hauteur en millimètres"
-                placeholder="Haut."
-                value={draft.heightMm}
-                onChange={(e) => setDraft((d) => ({ ...d, heightMm: e.target.value }))}
-              />
-            </div>
-            <p className="text-xs text-muted-foreground">
-              À renseigner maintenant : les dimensions ne sont plus modifiables après la
-              création de la déclinaison.
-            </p>
-          </div>
-        )}
+        {/* ═══════════════════════════════════════════════════════════════════════
+            LES DIMENSIONS ONT ÉTÉ RETIRÉES, ET C'EST LE CAS LE PLUS NET DE L'AUDIT.
+
+            Personne ne les lit. Elles ne sont pas dans `ProductVariantSummary`
+            (`Id, Sku, Attributes, Barcode, WeightGrams`), donc le vendeur qui les
+            saisissait ne pouvait PLUS JAMAIS les relire : le formulaire de modification
+            les réinitialisait à vide, et `UpdateProductVariantCommand` ne les porte pas.
+            Leur unique lecture dans tout le dépôt était un test unitaire.
+
+            Elles ne servent pas davantage au transport : `ShippingRate` le dit en toutes
+            lettres — « Le montant est un forfait, pas un calcul. Il ne dépend ni du
+            poids, ni du volume, ni du nombre d'articles. » Le seul point d'entrée
+            tarifaire prend une commune de destination.
+
+            L'ancien texte « À renseigner maintenant : les dimensions ne sont plus
+            modifiables après la création » était exact, et c'est bien ce qui le rendait
+            insoutenable : on demandait un effort définitif pour une donnée que rien ne
+            consomme.
+
+            Le champ reste dans le domaine et en base ; ce qui disparaît, c'est la
+            demande. `payload` envoie désormais `null` sur les trois.
+            ═══════════════════════════════════════════════════════════════════════ */}
 
         <div className="space-y-2">
           <Label>Attributs</Label>
