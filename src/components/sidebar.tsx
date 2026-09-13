@@ -155,14 +155,27 @@ export function Sidebar({
   const [collapsed, setCollapsed] = useState(false);
   const compteurs = useCompteursNav();
 
+  // `localStorage` NE SE CONTENTE PAS DE RENDRE `null` QUAND IL EST REFUSÉ : cookies
+  // bloqués ou navigation privée verrouillée, et c'est l'accès à la propriété qui lève
+  // une `SecurityError`. Ici l'enjeu dépasse la préférence perdue — ce composant est le
+  // layout : une exception non capturée emporterait TOUS les écrans vendeur, pour un
+  // réglage de largeur de menu.
   useEffect(() => {
-    if (typeof window !== "undefined" && window.localStorage.getItem(STORAGE_KEY) === "1") setCollapsed(true);
+    try {
+      if (window.localStorage.getItem(STORAGE_KEY) === "1") setCollapsed(true);
+    } catch {
+      // Menu déployé, comme par défaut.
+    }
   }, []);
 
   function toggle() {
     setCollapsed((c) => {
       const next = !c;
-      if (typeof window !== "undefined") window.localStorage.setItem(STORAGE_KEY, next ? "1" : "0");
+      try {
+        window.localStorage.setItem(STORAGE_KEY, next ? "1" : "0");
+      } catch {
+        // La bascule vaut pour cette visite ; seule la mémorisation est perdue.
+      }
       return next;
     });
   }
