@@ -1,0 +1,169 @@
+# =============================================================================
+# Déploiement AUTONOME de la console vendeur (front seul) sur n'importe quel VPS.
+# Inclut son propre Traefik + certificat Let's Encrypt. Aucun lien avec la pile
+# backend : la console appelle le BFF Vendeur par son URL PUBLIQUE (SELLER_BFF_URL).
+#
+#   1) DNS : ${CONSOLE_DOMAIN} → IP de CE serveur (enregistrement A, nuage GRIS).
+#   2) cp .env.prod.example .env.prod  puis renseigner les variables.
+#   3) ./deploy.sh prod up
+#
+# =============================================================================
+# CETTE PILE EST UNE ALTERNATIVE À LA PILE PRINCIPALE, PAS UN COMPLÉMENT.
+#
+# `marketPlace/deploy/docker-compose.prod.yml` porte DÉJÀ un service
+# `seller-console`, avec son propre Traefik. Les deux servent la même application.
+# On choisit l'une OU l'autre :
+#
+#   · Pile principale — la console tourne sur le VPS du backend, derrière le Traefik
+#     commun, et l'appelle par le réseau Docker interne. C'est le déploiement actuel.
+#   · Cette pile — la console tourne SEULE, sur son propre VPS, et appelle le BFF
+#     par Internet. C'est ce qu'il faut si le front doit vivre ailleurs que le back.
+#
+# LES DEUX SUR LE MÊME HÔTE NE PEUVENT PAS COEXISTER : ce Traefik-ci publie les ports
+# 80 et 443, déjà pris par celui de la pile principale. Le conteneur refusera de
+# démarrer — et c'est heureux, l'échec est immédiat et lisible.
+# =============================================================================
+
+x-logging: &logging
+  driver: "json-file"
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  # --- Reverse proxy + TLS (Let's Encrypt) ---------------------------------
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    logging: *logging
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Redirection HTTP -> HTTPS
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # ───────────────────────────────────────────────────────────────────────
+      # ACME PAR HTTP-01 ICI, PAR TLS-ALPN-01 DANS LA PILE PRINCIPALE.
+      #
+      # Ce n'est pas une incohérence à « harmoniser » : ce sont deux Traefik
+      # distincts, sur deux hôtes distincts, chacun avec son propre magasin ACME.
+      # Mais la différence compte le jour où l'on copie des drapeaux de l'un vers
+      # l'autre, et elle change le diagnostic de panne :
+      #
+      #   · HTTP-01 (ici)  — Let's Encrypt appelle le PORT 80, sur
+      #     /.well-known/acme-challenge/. Le port 80 doit donc rester ouvert, même
+      #     si tout le trafic utile est redirigé vers HTTPS.
+      #   · TLS-ALPN-01 (pile principale) — Let's Encrypt ouvre une connexion TLS
+      #     sur le port 443 et négocie le protocole ALPN `acme-tls/1`.
+      #
+      # Point commun, et c'est le seul qui compte en pratique : TOUT ÉQUIPEMENT QUI
+      # S'INTERPOSE CASSE L'ÉMISSION. Derrière le proxy Cloudflare (nuage orange),
+      # aucun des deux ne fonctionne — ni au premier déploiement, ni surtout au
+      # renouvellement, tous les 90 jours. L'enregistrement reste en « DNS only ».
+      #
+      # Le résolveur se nomme `le` ici et `letsencrypt` là-bas. Écrire un nom pour
+      # l'autre dans un label ne produit pas d'erreur au démarrage : simplement,
+      # aucun certificat n'est jamais émis.
+      # ───────────────────────────────────────────────────────────────────────
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/acme/acme.json"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "acme:/acme"
+
+  # --- Console vendeur (Next.js standalone) --------------------------------
+  seller-console:
+    # Le tag de PRODUCTION poussé par la CI est `:latest`, pas `:prod` — la console
+    # admin, elle, utilise `:prod`. Préférer de toute façon le tag `:<sha>`, que la
+    # CI pousse aussi : c'est le seul moyen de savoir après coup quel commit tourne,
+    # et de revenir en arrière sans reconstruire.
+    image: ${SELLER_CONSOLE_IMAGE:-ghcr.io/hectorberi01/seller-console:staging}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      NODE_ENV: "production"
+      # ─────────────────────────────────────────────────────────────────────────
+      # URL PUBLIQUE DU BFF VENDEUR, ET LE NAVIGATEUR NE LA VOIT JAMAIS.
+      #
+      # C'est le serveur Next qui l'appelle, depuis son relais `/api/bff/[...path]`.
+      # Le navigateur, lui, ne parle qu'à cette console. D'où trois conséquences,
+      # toutes vérifiées dans le code :
+      #
+      #   · La console peut vivre sur `hba-express.com` et le BFF sur
+      #     `hba-express.org` sans qu'aucune requête ne traverse d'origine.
+      #   · Rien à ouvrir dans `SELLER_CORS_ORIGINS` côté BFF : laissé vide, il
+      #     refuse toute origine, et c'est le bon réglage.
+      #   · Le cookie `mp_seller_session` est posé par Next sur sa PROPRE origine —
+      #     première partie, aucune question de SameSite.
+      #
+      # Dans CETTE pile, l'appel sort sur Internet au lieu de passer par le réseau
+      # Docker : l'URL doit donc être la publique, joignable depuis ce VPS.
+      # ─────────────────────────────────────────────────────────────────────────
+      SELLER_BFF_URL: "${SELLER_BFF_URL}"
+      # Secret de chiffrement du cookie de session : openssl rand -base64 32
+      SESSION_SECRET: "${SESSION_SECRET}"
+      SESSION_COOKIE_SECURE: "true"
+    healthcheck:
+      # SONDE PAR `node`, PAS PAR `curl` : l'image ne contient pas curl (voir son
+      # Dockerfile, qui s'en explique). Recopier la sonde de la console admin — elle
+      # utilise curl — donnerait un conteneur perpétuellement « unhealthy », que
+      # `deploy.sh` attendrait 150 s avant d'échouer sur une panne inexistante.
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "require('http').get('http://127.0.0.1:3000/api/health',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    labels:
+      - "traefik.enable=true"
+      # ─────────────────────────────────────────────────────────────────────────
+      # ROUTEUR NOMMÉ `seller-console-standalone`, ET PAS `seller-console`.
+      #
+      # La pile principale déclare déjà un routeur `seller-console`. Tant que les
+      # deux piles vivent sur deux hôtes, les noms ne se croisent pas — mais le jour
+      # où ce service serait branché sur le Traefik de la pile principale, deux
+      # routeurs de même nom se recouvriraient et l'un disparaîtrait SANS ERREUR,
+      # chaque pile ayant démarré correctement de son côté. Le cas s'est déjà
+      # présenté entre la console admin et la pile principale.
+      # ─────────────────────────────────────────────────────────────────────────
+      - "traefik.http.routers.seller-console-standalone.rule=Host(`${CONSOLE_DOMAIN}`)"
+      - "traefik.http.routers.seller-console-standalone.entrypoints=websecure"
+      - "traefik.http.routers.seller-console-standalone.tls.certresolver=le"
+      - "traefik.http.routers.seller-console-standalone.middlewares=console-edge"
+      - "traefik.http.services.seller-console-standalone.loadbalancer.server.port=3000"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # EN-TÊTES DE SÉCURITÉ ET LIMITATION DE DÉBIT, DÉCLARÉS ICI.
+      #
+      # La pile principale applique `edge-chain@file` à toutes ses surfaces. Cette
+      # pile-ci n'a pas de provider « file » : sans ces labels, la console serait
+      # servie SANS HSTS, sans protection contre le cadrage, et sans aucune limite
+      # de débit — alors qu'elle porte l'écran de connexion des vendeurs. Le
+      # déploiement autonome de la console admin a précisément cet oubli.
+      #
+      # HSTS à un an et `includeSubDomains` : à ne poser que sur un domaine dont
+      # TOUS les sous-domaines sont en HTTPS. C'est le cas de `hba-express.com`.
+      # ─────────────────────────────────────────────────────────────────────────
+      - "traefik.http.middlewares.console-sec.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.console-sec.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.console-sec.headers.stsPreload=false"
+      - "traefik.http.middlewares.console-sec.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.console-sec.headers.frameDeny=true"
+      - "traefik.http.middlewares.console-sec.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.console-sec.headers.referrerPolicy=strict-origin-when-cross-origin"
+      # Limite de bordure : moyenne de 50 req/s par IP, rafales à 100. Assez large
+      # pour un usage normal, assez serré pour qu'un bourrage d'identifiants coûte.
+      - "traefik.http.middlewares.console-rl.ratelimit.average=50"
+      - "traefik.http.middlewares.console-rl.ratelimit.burst=100"
+      - "traefik.http.middlewares.console-edge.chain.middlewares=console-sec,console-rl"
+
+volumes:
+  acme:
