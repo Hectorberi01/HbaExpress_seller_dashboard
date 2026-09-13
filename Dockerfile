@@ -19,11 +19,48 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-# ⚠️ AUCUN secret n'est passé au build, et c'est volontaire.
+# AUCUN secret n'est passé au build, et c'est volontaire.
 #
 # `SESSION_SECRET` et `SELLER_BFF_URL` ne sont lus qu'à L'EXÉCUTION (côté serveur
 # Next, jamais côté navigateur). Les injecter ici les figerait dans une couche de
 # l'image — donc dans le registre, donc lisibles par quiconque peut tirer l'image.
+# ---------------------------------------------------------------------------
+# LES VARIABLES `NEXT_PUBLIC_*` SONT L'EXCEPTION, ET ELLE EST OBLIGATOIRE.
+#
+# Next les SUBSTITUE DANS LE CODE au moment du `next build` : elles n'existent plus
+# comme variables à l'exécution, seulement comme littéraux dans le paquet envoyé au
+# navigateur. Les poser uniquement dans le compose n'a donc STRICTEMENT AUCUN EFFET —
+# le bouton « Activer les notifications » répondrait « pas encore configurées », sans
+# rien dans les journaux pour l'expliquer.
+#
+# Ce n'est pas une fuite : ces valeurs sont publiques par construction (elles partent
+# dans le JavaScript de chaque page et dans le service worker). Ce sont des
+# identifiants de projet Firebase, pas des secrets. Le secret de la messagerie est le
+# compte de service, et il reste côté serveur, monté sur le VPS du backend.
+#
+# À passer en `--build-arg` (ou `args:` du compose de build, ou `build-args:` du
+# workflow GitHub). Laissées vides, le push est simplement DÉSACTIVÉ, proprement.
+# ---------------------------------------------------------------------------
+ARG NEXT_PUBLIC_FIREBASE_API_KEY=""
+ARG NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN="hbaexpress-8b056.firebaseapp.com"
+ARG NEXT_PUBLIC_FIREBASE_PROJECT_ID="hbaexpress-8b056"
+ARG NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET="hbaexpress-8b056.firebasestorage.app"
+ARG NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID="191660803638"
+ARG NEXT_PUBLIC_FIREBASE_APP_ID="1:191660803638:web:96d0c7632c24f138727a97"
+ARG NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID="G-XV8KKP65KS"
+ARG NEXT_PUBLIC_FIREBASE_VAPID_KEY="BJyKgIAtijWhmZT7E75Cg1da26x0SDMGCICUsfRlxsxHL97ndAr_B8D_5gEnvH3ZMUh_u8BoqcrmuuKMrNmHy_A"
+ARG NEXT_PUBLIC_FIREBASE_ANALYTICS="true"
+
+ENV NEXT_PUBLIC_FIREBASE_API_KEY=$NEXT_PUBLIC_FIREBASE_API_KEY \
+    NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=$NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN \
+    NEXT_PUBLIC_FIREBASE_PROJECT_ID=$NEXT_PUBLIC_FIREBASE_PROJECT_ID \
+    NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=$NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET \
+    NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=$NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID \
+    NEXT_PUBLIC_FIREBASE_APP_ID=$NEXT_PUBLIC_FIREBASE_APP_ID \
+    NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID=$NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID \
+    NEXT_PUBLIC_FIREBASE_VAPID_KEY=$NEXT_PUBLIC_FIREBASE_VAPID_KEY \
+    NEXT_PUBLIC_FIREBASE_ANALYTICS=$NEXT_PUBLIC_FIREBASE_ANALYTICS
+
 RUN npm run build
 
 # 3) Exécution — sortie standalone, image minimale.
